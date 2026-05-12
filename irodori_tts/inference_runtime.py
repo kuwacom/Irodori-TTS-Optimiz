@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 import json
 import math
 import secrets
@@ -506,6 +507,57 @@ class InferenceRuntime:
             default_caption_max_len=default_caption_max_len,
         )
 
+    def _reference_latent_cache_path(self, *, req: SamplingRequest) -> Path | None:
+        if req.ref_wav is None:
+            return None
+
+        cache_payload = {
+            "version": 1,
+            "source_sha256": _hash_file(req.ref_wav),
+            "codec_repo": self.key.codec_repo,
+            "codec_deterministic_encode": bool(self.key.codec_deterministic_encode),
+            "codec_sample_rate": int(self.codec.sample_rate),
+            "codec_hop_length": int(self.codec.model.hop_length),
+            "model_latent_dim": int(self.model_cfg.latent_dim),
+            "max_ref_seconds": None if req.max_ref_seconds is None else float(req.max_ref_seconds),
+            "ref_normalize_db": None if req.ref_normalize_db is None else float(req.ref_normalize_db),
+            "ref_ensure_max": bool(req.ref_ensure_max),
+        }
+        cache_name = f"{_cache_key_hash(cache_payload)}.pt"
+        return Path("cache") / "latent" / cache_name
+
+    def _load_cached_reference_latent(self, cache_path: Path, messages: list[str]) -> torch.Tensor | None:
+        if not cache_path.exists():
+            return None
+        try:
+            latent = torch.load(cache_path, map_location="cpu", weights_only=True)
+            if not isinstance(latent, torch.Tensor):
+                raise ValueError(f"cached payload is {type(latent)!r}, not torch.Tensor")
+        except Exception as exc:
+            messages.append(
+                f"warning: failed to load cached reference latent ({cache_path}): {exc}. Re-encoding reference audio."
+            )
+            return None
+
+        messages.append(f"info: loaded cached reference latent: {cache_path}")
+        return latent
+
+    def _save_cached_reference_latent(
+        self,
+        *,
+        cache_path: Path,
+        ref_latent: torch.Tensor,
+        messages: list[str],
+    ) -> None:
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = cache_path.with_name(f".{cache_path.name}.{secrets.token_hex(8)}.tmp")
+            torch.save(ref_latent.cpu(), tmp_path)
+            tmp_path.replace(cache_path)
+            messages.append(f"info: saved reference latent cache: {cache_path}")
+        except Exception as exc:
+            messages.append(f"warning: failed to save reference latent cache ({cache_path}): {exc}")
+
     def _load_reference_latent(
         self,
         *,
@@ -557,27 +609,39 @@ class InferenceRuntime:
             ).unsqueeze(0)
             ref_latent = ref_latent.to(dtype=runtime_dtype)
         else:
-            wav, sr = _load_audio(req.ref_wav)
-            if req.max_ref_seconds is not None and req.max_ref_seconds > 0:
-                max_ref_samples = max(1, int(float(req.max_ref_seconds) * float(sr)))
-                if wav.shape[1] > max_ref_samples:
+            cache_path = self._reference_latent_cache_path(req=req)
+            ref_latent = None if cache_path is None else self._load_cached_reference_latent(cache_path, messages)
+            if ref_latent is None:
+                wav, sr = _load_audio(req.ref_wav)
+                if req.max_ref_seconds is not None and req.max_ref_seconds > 0:
+                    max_ref_samples = max(1, int(float(req.max_ref_seconds) * float(sr)))
+                    if wav.shape[1] > max_ref_samples:
+                        messages.append(
+                            f"warning: reference audio exceeds max_ref_seconds ({req.max_ref_seconds}s). "
+                            f"Trimming from {float(wav.shape[1]) / float(sr):.2f}s to {float(max_ref_samples) / float(sr):.2f}s."
+                        )
+                        wav = wav[:, :max_ref_samples]
+                if req.ref_normalize_db is not None:
                     messages.append(
-                        f"warning: reference audio exceeds max_ref_seconds ({req.max_ref_seconds}s). "
-                        f"Trimming from {float(wav.shape[1]) / float(sr):.2f}s to {float(max_ref_samples) / float(sr):.2f}s."
+                        f"info: reference loudness normalize enabled (target_db={float(req.ref_normalize_db):.2f}, includes peak safety scaling)."
                     )
-                    wav = wav[:, :max_ref_samples]
-            if req.ref_normalize_db is not None:
-                messages.append(
-                    f"info: reference loudness normalize enabled (target_db={float(req.ref_normalize_db):.2f}, includes peak safety scaling)."
-                )
-            elif req.ref_ensure_max:
-                messages.append("info: reference peak safety scaling enabled (ensure_max=True).")
-            ref_latent = self.codec.encode_waveform(
-                wav.unsqueeze(0),
-                sample_rate=int(sr),
-                normalize_db=req.ref_normalize_db,
-                ensure_max=bool(req.ref_ensure_max),
-            ).cpu()
+                elif req.ref_ensure_max:
+                    messages.append("info: reference peak safety scaling enabled (ensure_max=True).")
+                ref_latent = self.codec.encode_waveform(
+                    wav.unsqueeze(0),
+                    sample_rate=int(sr),
+                    normalize_db=req.ref_normalize_db,
+                    ensure_max=bool(req.ref_ensure_max),
+                ).cpu()
+                if cache_path is not None:
+                    self._save_cached_reference_latent(
+                        cache_path=cache_path,
+                        ref_latent=ref_latent,
+                        messages=messages,
+                    )
+            else:
+                ref_latent = _coerce_latent_shape(ref_latent, latent_dim=self.model_cfg.latent_dim).unsqueeze(0)
+            ref_latent = ref_latent.to(dtype=runtime_dtype)
 
         if max_ref_latent_steps is not None and ref_latent.shape[1] > max_ref_latent_steps:
             messages.append(
@@ -928,6 +992,19 @@ def clear_cached_runtime() -> None:
 
     if runtime is not None:
         runtime.unload()
+
+
+def _hash_file(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _cache_key_hash(payload: dict[str, object]) -> str:
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def _load_audio(path: str | Path) -> tuple[torch.Tensor, int]:

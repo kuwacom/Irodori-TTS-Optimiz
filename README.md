@@ -1,3 +1,71 @@
+# JP
+
+# Irodori-TTS-Optimiz
+
+**Irodori-TTS-Optimiz** は、[Aratako/Irodori-TTS](https://github.com/Aratako/Irodori-TTS) をベースにしたフォーク版です。
+本家 Irodori-TTS の v2 コードベース / モデル互換性を維持しつつ、推論時の実用性・速度改善を目的とした最適化を追加しています。
+
+> [!NOTE]
+> 以降の英語セクションには本家 Irodori-TTS 由来の説明も含まれます。
+> このフォーク独自の変更点は、まずこの日本語セクションの「最適化項目」に追記して管理します。
+
+## 最適化項目
+
+このフォークで追加した最適化・変更点をここに追記していきます。
+
+### Reference Audio Latent Cache
+
+Reference Audio を使った推論時に、参照音声を DACVAE latent へエンコードした結果をキャッシュするようにしました。
+
+- 保存先: `./cache/latent/`
+- 対象: `ref_wav` を指定した reference audio 推論
+- 非対象: `--no-ref` 推論、`ref_latent` を直接指定する推論、VoiceDesign の no-reference 推論
+- 効果: 同じ reference audio と同じ前処理設定で再推論する場合、reference audio の読み込み・DACVAE encode を省略できます。
+
+キャッシュキーには主に以下が含まれます。
+
+- reference audio ファイル内容の SHA-256
+- codec repo / deterministic encode 設定
+- codec sample rate / hop length
+- model latent dim
+- `max_ref_seconds`
+- `ref_normalize_db`
+- `ref_ensure_max`
+
+そのため、同じ音声ファイルでも reference の最大秒数や正規化設定を変えると別キャッシュとして扱われます。
+キャッシュは生成物なので Git 管理対象外です。不要になった場合は `./cache/latent/` を削除してください。
+
+### Legacy NVIDIA GPU Support
+
+Tesla P40 などの Pascal 世代 / `sm_61` 系レガシー NVIDIA GPU 向けのインストール経路を追加しました。
+
+本家 v2 の通常構成では Linux / Windows の CUDA 環境に対して PyTorch `cu128` 系が選ばれますが、PyTorch `2.10.x + cu128` は Pascal 世代 GPU をサポートしません。
+このフォークでは `legacy-cuda` extra を追加し、古い GPU では PyTorch / Torchaudio `2.5.1` + `cu118` を使えるようにしています。
+
+対象例:
+
+- Tesla P40
+- Compute Capability `sm_61` の NVIDIA GPU
+- 新しい `cu128` 版 PyTorch で実行できない古い CUDA GPU
+
+使い方:
+
+```bash
+uv sync --extra legacy-cuda
+```
+
+この設定により、`pyproject.toml` の `legacy-cuda` optional dependency と `pytorch-cu118` index が使われます。
+通常の新しい GPU では、従来通り `uv sync` で `cu128` 系を利用してください。
+
+### 今後追加予定・追記用
+
+- REST API 化
+- 生成結果 / reference latent 管理の改善
+- 推論パラメータのプリセット化
+- その他の高速化・省メモリ化
+
+---
+
 # Irodori-TTS
 
 [![Model](https://img.shields.io/badge/Model-HuggingFace-yellow)](https://huggingface.co/Aratako/Irodori-TTS-500M-v2)
@@ -169,52 +237,52 @@ uv run python infer.py \
 
 ### Inference Parameters
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--checkpoint` / `--hf-checkpoint` | (required, either one) | Local checkpoint file or Hugging Face repo id |
-| `--text` | (required) | Text to synthesize |
-| `--caption` | None | Optional style-control text for VoiceDesign checkpoints |
-| `--output-wav` | `output.wav` | Output waveform path |
-| `--ref-wav` | None | Reference waveform path for speaker conditioning |
-| `--ref-latent` | None | Pre-computed reference latent (`.pt`) for speaker conditioning |
-| `--no-ref` | False | Disable speaker reference conditioning |
-| `--max-ref-seconds` | `30.0` | Maximum reference duration in seconds |
-| `--ref-normalize-db` | -16.0 | Reference loudness target before DACVAE encode (set `none` to disable) |
-| `--ref-ensure-max` | True | Scale reference down only when peak exceeds 1.0 (used when `--ref-normalize-db` is disabled) |
-| `--codec-repo` | `Aratako/Semantic-DACVAE-Japanese-32dim` | Codec repo used for latent encode/decode |
-| `--codec-deterministic-encode` | True | Use deterministic DACVAE encode path |
-| `--codec-deterministic-decode` | True | Use deterministic DACVAE watermark-message decode path |
-| `--enable-watermark` | False | Enable DACVAE watermark branch during decode |
-| `--max-text-len` | checkpoint metadata or `256` | Maximum token length for text conditioning |
-| `--max-caption-len` | checkpoint metadata or `max_text_len` | Maximum token length for caption conditioning |
-| `--num-steps` | 40 | Number of Euler integration steps |
-| `--num-candidates` | 1 | Number of candidates to generate in one pass |
-| `--decode-mode` | `sequential` | Codec decode mode: `sequential` or `batch` |
-| `--cfg-scale-text` | 3.0 | CFG scale for text conditioning |
-| `--cfg-scale-caption` | 3.0 | CFG scale for caption conditioning |
-| `--cfg-scale-speaker` | 5.0 | CFG scale for speaker conditioning |
-| `--cfg-guidance-mode` | `independent` | CFG mode: `independent`, `joint`, `alternating` |
-| `--cfg-scale` | None | Deprecated shared CFG override for all enabled conditions |
-| `--cfg-min-t` | `0.5` | Lower timestep bound for CFG |
-| `--cfg-max-t` | `1.0` | Upper timestep bound for CFG |
-| `--truncation-factor` | None | Scale initial Gaussian noise before sampling |
-| `--rescale-k` / `--rescale-sigma` | None | Temporal score rescaling parameters; must be set together |
-| `--context-kv-cache` | True | Precompute context K/V projections for faster sampling |
-| `--speaker-kv-scale` | None | Extra speaker K/V scaling for stronger speaker identity |
-| `--speaker-kv-min-t` | `0.9` | Disable speaker K/V scaling after this timestep threshold |
-| `--speaker-kv-max-layers` | None | Apply speaker K/V scaling only to first N diffusion layers |
-| `--model-device` | auto | Device for model (`cuda`, `mps`, `cpu`) |
-| `--codec-device` | auto | Device for DACVAE codec |
-| `--model-precision` | `fp32` | Model precision (`fp32`, `bf16`) |
-| `--codec-precision` | `fp32` | Codec precision (`fp32`, `bf16`) |
-| `--seed` | random | Random seed for reproducibility |
-| `--compile-model` | False | Enable `torch.compile` for faster inference |
-| `--compile-dynamic` | False | Use `dynamic=True` for `torch.compile` |
-| `--trim-tail` | True | Trim trailing silence via flattening heuristic |
-| `--tail-window-size` | `20` | Window size used for tail trimming |
-| `--tail-std-threshold` | `0.05` | Std threshold for tail trimming |
-| `--tail-mean-threshold` | `0.1` | Mean threshold for tail trimming |
-| `--show-timings` | True | Print per-stage timing breakdown |
+| Parameter                          | Default                                  | Description                                                                                  |
+| ---------------------------------- | ---------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `--checkpoint` / `--hf-checkpoint` | (required, either one)                   | Local checkpoint file or Hugging Face repo id                                                |
+| `--text`                           | (required)                               | Text to synthesize                                                                           |
+| `--caption`                        | None                                     | Optional style-control text for VoiceDesign checkpoints                                      |
+| `--output-wav`                     | `output.wav`                             | Output waveform path                                                                         |
+| `--ref-wav`                        | None                                     | Reference waveform path for speaker conditioning                                             |
+| `--ref-latent`                     | None                                     | Pre-computed reference latent (`.pt`) for speaker conditioning                               |
+| `--no-ref`                         | False                                    | Disable speaker reference conditioning                                                       |
+| `--max-ref-seconds`                | `30.0`                                   | Maximum reference duration in seconds                                                        |
+| `--ref-normalize-db`               | -16.0                                    | Reference loudness target before DACVAE encode (set `none` to disable)                       |
+| `--ref-ensure-max`                 | True                                     | Scale reference down only when peak exceeds 1.0 (used when `--ref-normalize-db` is disabled) |
+| `--codec-repo`                     | `Aratako/Semantic-DACVAE-Japanese-32dim` | Codec repo used for latent encode/decode                                                     |
+| `--codec-deterministic-encode`     | True                                     | Use deterministic DACVAE encode path                                                         |
+| `--codec-deterministic-decode`     | True                                     | Use deterministic DACVAE watermark-message decode path                                       |
+| `--enable-watermark`               | False                                    | Enable DACVAE watermark branch during decode                                                 |
+| `--max-text-len`                   | checkpoint metadata or `256`             | Maximum token length for text conditioning                                                   |
+| `--max-caption-len`                | checkpoint metadata or `max_text_len`    | Maximum token length for caption conditioning                                                |
+| `--num-steps`                      | 40                                       | Number of Euler integration steps                                                            |
+| `--num-candidates`                 | 1                                        | Number of candidates to generate in one pass                                                 |
+| `--decode-mode`                    | `sequential`                             | Codec decode mode: `sequential` or `batch`                                                   |
+| `--cfg-scale-text`                 | 3.0                                      | CFG scale for text conditioning                                                              |
+| `--cfg-scale-caption`              | 3.0                                      | CFG scale for caption conditioning                                                           |
+| `--cfg-scale-speaker`              | 5.0                                      | CFG scale for speaker conditioning                                                           |
+| `--cfg-guidance-mode`              | `independent`                            | CFG mode: `independent`, `joint`, `alternating`                                              |
+| `--cfg-scale`                      | None                                     | Deprecated shared CFG override for all enabled conditions                                    |
+| `--cfg-min-t`                      | `0.5`                                    | Lower timestep bound for CFG                                                                 |
+| `--cfg-max-t`                      | `1.0`                                    | Upper timestep bound for CFG                                                                 |
+| `--truncation-factor`              | None                                     | Scale initial Gaussian noise before sampling                                                 |
+| `--rescale-k` / `--rescale-sigma`  | None                                     | Temporal score rescaling parameters; must be set together                                    |
+| `--context-kv-cache`               | True                                     | Precompute context K/V projections for faster sampling                                       |
+| `--speaker-kv-scale`               | None                                     | Extra speaker K/V scaling for stronger speaker identity                                      |
+| `--speaker-kv-min-t`               | `0.9`                                    | Disable speaker K/V scaling after this timestep threshold                                    |
+| `--speaker-kv-max-layers`          | None                                     | Apply speaker K/V scaling only to first N diffusion layers                                   |
+| `--model-device`                   | auto                                     | Device for model (`cuda`, `mps`, `cpu`)                                                      |
+| `--codec-device`                   | auto                                     | Device for DACVAE codec                                                                      |
+| `--model-precision`                | `fp32`                                   | Model precision (`fp32`, `bf16`)                                                             |
+| `--codec-precision`                | `fp32`                                   | Codec precision (`fp32`, `bf16`)                                                             |
+| `--seed`                           | random                                   | Random seed for reproducibility                                                              |
+| `--compile-model`                  | False                                    | Enable `torch.compile` for faster inference                                                  |
+| `--compile-dynamic`                | False                                    | Use `dynamic=True` for `torch.compile`                                                       |
+| `--trim-tail`                      | True                                     | Trim trailing silence via flattening heuristic                                               |
+| `--tail-window-size`               | `20`                                     | Window size used for tail trimming                                                           |
+| `--tail-std-threshold`             | `0.05`                                   | Std threshold for tail trimming                                                              |
+| `--tail-mean-threshold`            | `0.1`                                    | Mean threshold for tail trimming                                                             |
+| `--show-timings`                   | True                                     | Print per-stage timing breakdown                                                             |
 
 ## Training
 
@@ -268,7 +336,13 @@ voice-design path disables speaker/reference conditioning and learns from `text 
 This produces a JSONL manifest with entries like:
 
 ```json
-{"text": "こんにちは", "caption": "落ち着いた、近い距離感の女性話者", "latent_path": "data/latents/00001.pt", "speaker_id": "myorg/my_dataset:speaker_001", "num_frames": 750}
+{
+  "text": "こんにちは",
+  "caption": "落ち着いた、近い距離感の女性話者",
+  "latent_path": "data/latents/00001.pt",
+  "speaker_id": "myorg/my_dataset:speaker_001",
+  "num_frames": 750
+}
 ```
 
 ### 2. Training
