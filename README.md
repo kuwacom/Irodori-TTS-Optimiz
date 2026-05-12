@@ -52,6 +52,28 @@ uv sync
 
 **Note**: For Linux/Windows with CUDA, PyTorch is automatically installed from the cu128 index. For macOS (MPS) or CPU-only usage, `uv sync` will install the default PyTorch build.
 
+### Legacy NVIDIA GPU (Tesla P40 / sm_61)
+
+PyTorch `2.10.x + cu128` does not support Pascal-generation GPUs such as `Tesla P40` (`sm_61`).
+If your machine has this class of GPU, install the legacy CUDA extra instead:
+
+```bash
+uv sync --extra legacy-cuda
+```
+
+This extra pins PyTorch / Torchaudio to `2.5.1` from the `cu118` index, which is a better fit for older NVIDIA cards.
+
+### Hugging Face cache path
+
+If you want model downloads under this repository, set the cache directories before launching:
+
+```bash
+export HF_HOME="$PWD/models/hub"
+export HUGGINGFACE_HUB_CACHE="$PWD/models/hub"
+```
+
+Then WebUI / CLI downloads such as `Aratako/Irodori-TTS-500M-v2-VoiceDesign` will be stored under `./models/hub`.
+
 ## Quick Start
 
 ### Simple Inference
@@ -97,6 +119,14 @@ The hosted v2 demo is available at [Aratako/Irodori-TTS-500M-v2-Demo](https://hu
 For the VoiceDesign checkpoint, use the dedicated UI:
 
 ```bash
+uv run python gradio_app_voicedesign.py --server-name 0.0.0.0 --server-port 7861
+```
+
+For Tesla P40-class GPUs with a local Hugging Face cache:
+
+```bash
+HF_HOME="$PWD/models/hub" \
+HUGGINGFACE_HUB_CACHE="$PWD/models/hub" \
 uv run python gradio_app_voicedesign.py --server-name 0.0.0.0 --server-port 7861
 ```
 

@@ -17,8 +17,8 @@ dependencies = [
     "safetensors>=0.7.0",
     "soundfile>=0.12.0",
     "sentencepiece>=0.1.99,<0.2",
-    "torch>=2.10.0",
-    "torchaudio>=2.10.0",
+    "torch",
+    "torchaudio",
     "torchcodec>=0.10.0",
     "transformers<5",
     "tqdm>=4.67.3",
@@ -29,15 +29,33 @@ dependencies = [
 dev = [
     "ruff>=0.9.0",
 ]
+legacy-cuda = [
+    "torch==2.5.1",
+    "torchaudio==2.5.1",
+]
 
 [tool.uv.sources]
-torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }]
-torchaudio = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }]
 dacvae = { git = "https://github.com/facebookresearch/dacvae" }
+torch = [
+    { index = "pytorch-cu118", extra = "legacy-cuda", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { index = "pytorch-cu128", marker = "(sys_platform == 'linux' or sys_platform == 'win32') and extra != 'legacy-cuda'" },
+]
+torchaudio = [
+    { index = "pytorch-cu118", extra = "legacy-cuda", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { index = "pytorch-cu128", marker = "(sys_platform == 'linux' or sys_platform == 'win32') and extra != 'legacy-cuda'" },
+]
+
+[tool.uv]
+environments = ["python_version == '3.10'"]
 
 [[tool.uv.index]]
 name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu118"
+url = "https://download.pytorch.org/whl/cu118"
 explicit = true
 
 [tool.ruff]
