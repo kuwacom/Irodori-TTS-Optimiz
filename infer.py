@@ -173,6 +173,15 @@ def main() -> None:
     )
     parser.add_argument("--num-steps", type=int, default=40)
     parser.add_argument(
+        "--sampling-preset",
+        choices=["quality", "balanced", "speed", "extreme", "custom"],
+        default="custom",
+        help=(
+            "Sampling speed/quality preset. "
+            "quality/custom keep explicit arguments; balanced/speed/extreme override steps and CFG mode/range."
+        ),
+    )
+    parser.add_argument(
         "--num-candidates",
         type=int,
         default=1,
@@ -378,6 +387,7 @@ def main() -> None:
             else None,
             max_text_len=None if args.max_text_len is None else int(args.max_text_len),
             max_caption_len=None if args.max_caption_len is None else int(args.max_caption_len),
+            sampling_preset=str(args.sampling_preset),
             num_steps=int(args.num_steps),
             cfg_scale_text=cfg_scale_text,
             cfg_scale_caption=cfg_scale_caption,

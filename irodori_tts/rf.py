@@ -140,6 +140,15 @@ def sample_euler_rf_cfg(
     speaker_kv_scale: float | None = None,
     speaker_kv_max_layers: int | None = None,
     speaker_kv_min_t: float | None = None,
+    encoded_conditions: tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]
+    | None = None,
 ) -> torch.Tensor:
     """
     Euler sampling over RF ODE with text/reference/caption conditioning CFG.
@@ -183,21 +192,31 @@ def sample_euler_rf_cfg(
     use_joint_cfg = cfg_guidance_mode == "joint"
     use_alternating_cfg = cfg_guidance_mode == "alternating"
 
-    (
-        text_state_cond,
-        text_mask_cond,
-        speaker_state_cond,
-        speaker_mask_cond,
-        caption_state_cond,
-        caption_mask_cond,
-    ) = model.encode_conditions(
-        text_input_ids=text_input_ids,
-        text_mask=text_mask,
-        ref_latent=ref_latent,
-        ref_mask=ref_mask,
-        caption_input_ids=caption_input_ids,
-        caption_mask=caption_mask,
-    )
+    if encoded_conditions is None:
+        (
+            text_state_cond,
+            text_mask_cond,
+            speaker_state_cond,
+            speaker_mask_cond,
+            caption_state_cond,
+            caption_mask_cond,
+        ) = model.encode_conditions(
+            text_input_ids=text_input_ids,
+            text_mask=text_mask,
+            ref_latent=ref_latent,
+            ref_mask=ref_mask,
+            caption_input_ids=caption_input_ids,
+            caption_mask=caption_mask,
+        )
+    else:
+        (
+            text_state_cond,
+            text_mask_cond,
+            speaker_state_cond,
+            speaker_mask_cond,
+            caption_state_cond,
+            caption_mask_cond,
+        ) = encoded_conditions
     text_state_uncond = torch.zeros_like(text_state_cond)
     text_mask_uncond = torch.zeros_like(text_mask_cond)
     speaker_state_uncond = None

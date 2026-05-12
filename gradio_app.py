@@ -174,6 +174,7 @@ def _run_generation(
     text: str,
     uploaded_audio: str | None,
     num_steps: int,
+    sampling_preset: str,
     num_candidates: int,
     seed_raw: str,
     cfg_guidance_mode: str,
@@ -258,6 +259,7 @@ def _run_generation(
             seconds=FIXED_SECONDS,
             max_ref_seconds=30.0,
             max_text_len=None,
+            sampling_preset=str(sampling_preset),
             num_steps=int(num_steps),
             seed=None if seed is None else int(seed),
             cfg_guidance_mode=str(cfg_guidance_mode),
@@ -376,6 +378,11 @@ def build_ui() -> gr.Blocks:
         with gr.Accordion("Sampling", open=True):
             with gr.Row():
                 num_steps = gr.Slider(label="Num Steps", minimum=1, maximum=120, value=40, step=1)
+                sampling_preset = gr.Dropdown(
+                    label="Sampling Preset",
+                    choices=["custom", "quality", "balanced", "speed", "extreme"],
+                    value="custom",
+                )
                 num_candidates = gr.Slider(
                     label="Num Candidates",
                     minimum=1,
@@ -460,6 +467,7 @@ def build_ui() -> gr.Blocks:
                 text,
                 uploaded_audio,
                 num_steps,
+                sampling_preset,
                 num_candidates,
                 seed_raw,
                 cfg_guidance_mode,

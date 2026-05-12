@@ -7,6 +7,7 @@ import math
 import secrets
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,7 +20,7 @@ from safetensors.torch import load_file as load_safetensors_file
 from .codec import DACVAECodec, patchify_latent, unpatchify_latent
 from .config import ModelConfig
 from .lora import checkpoint_state_uses_lora
-from .model import TextToLatentRFDiT
+from .model import TextToLatentRFDiT, patch_sequence_with_mask
 from .rf import sample_euler_rf_cfg
 from .text_normalization import normalize_text
 from .tokenizer import PretrainedTextTokenizer
@@ -179,6 +180,7 @@ class SamplingRequest:
     max_ref_seconds: float | None = 30.0
     max_text_len: int | None = None
     max_caption_len: int | None = None
+    sampling_preset: str | None = None
     num_steps: int = 40
     cfg_scale_text: float = 3.0
     cfg_scale_caption: float = 3.0
@@ -417,6 +419,173 @@ class InferenceRuntime:
         self.default_text_max_len = default_text_max_len
         self.default_caption_max_len = default_caption_max_len
         self._infer_lock = threading.Lock()
+        self._condition_cache_lock = threading.Lock()
+        self._speaker_condition_cache: OrderedDict[str, EncodedSpeakerCondition] = OrderedDict()
+        self._caption_condition_cache: OrderedDict[str, EncodedCaptionCondition] = OrderedDict()
+        self._condition_cache_max_size = 32
+
+    def _apply_sampling_preset(self, req: SamplingRequest, messages: list[str]) -> None:
+        preset = "quality" if req.sampling_preset is None else str(req.sampling_preset).strip().lower()
+        if preset in {"", "none", "off", "custom", "manual"}:
+            return
+        if preset == "quality":
+            return
+        if preset == "balanced":
+            req.num_steps = 30
+            req.cfg_guidance_mode = "alternating"
+            req.cfg_min_t = 0.55
+            req.cfg_max_t = 1.0
+        elif preset == "speed":
+            req.num_steps = 24
+            req.cfg_guidance_mode = "joint"
+            req.cfg_scale = 3.0
+            req.cfg_min_t = 0.6
+            req.cfg_max_t = 1.0
+        elif preset in {"extreme", "extreme-speed", "extreme_speed"}:
+            req.num_steps = 16
+            req.cfg_guidance_mode = "joint"
+            req.cfg_scale = 2.0
+            req.cfg_min_t = 0.7
+            req.cfg_max_t = 1.0
+        else:
+            raise ValueError(
+                f"Unsupported sampling_preset={req.sampling_preset!r}. "
+                "Expected one of: quality, balanced, speed, extreme, custom."
+            )
+        messages.append(
+            "info: applied sampling preset "
+            f"{preset} (steps={req.num_steps}, cfg_mode={req.cfg_guidance_mode}, "
+            f"cfg_scale={req.cfg_scale}, cfg_t=[{req.cfg_min_t}, {req.cfg_max_t}])."
+        )
+
+    def _caption_condition_cache_key(
+        self,
+        *,
+        caption_text: str,
+        caption_ids: torch.Tensor,
+        caption_mask: torch.Tensor,
+    ) -> str:
+        payload = {
+            "version": 1,
+            "checkpoint": str(self.key.checkpoint),
+            "model_device": str(self.model_device),
+            "model_precision": str(self.key.model_precision),
+            "caption_text_sha256": hashlib.sha256(caption_text.encode("utf-8")).hexdigest(),
+            "caption_shape": list(caption_ids.shape),
+            "caption_mask_shape": list(caption_mask.shape),
+            "caption_tokenizer_repo": self.model_cfg.caption_tokenizer_repo_resolved,
+            "caption_add_bos": bool(self.model_cfg.caption_add_bos_resolved),
+        }
+        return _cache_key_hash(payload)
+
+    def _speaker_condition_cache_key(
+        self,
+        *,
+        ref_latent: torch.Tensor | None,
+        ref_mask: torch.Tensor | None,
+        req: SamplingRequest,
+    ) -> str | None:
+        if ref_latent is None or ref_mask is None or not self.model_cfg.use_speaker_condition:
+            return None
+        ref_cpu = ref_latent.detach().to(device="cpu", dtype=torch.float32).contiguous()
+        mask_cpu = ref_mask.detach().to(device="cpu").contiguous()
+        payload = {
+            "version": 1,
+            "checkpoint": str(self.key.checkpoint),
+            "model_device": str(self.model_device),
+            "model_precision": str(self.key.model_precision),
+            "latent_sha256": hashlib.sha256(ref_cpu.numpy().tobytes()).hexdigest(),
+            "mask_sha256": hashlib.sha256(mask_cpu.numpy().tobytes()).hexdigest(),
+            "latent_shape": list(ref_latent.shape),
+            "mask_shape": list(ref_mask.shape),
+            "latent_patch_size": int(self.model_cfg.latent_patch_size),
+            "speaker_patch_size": int(self.model_cfg.speaker_patch_size),
+            "max_ref_seconds": None if req.max_ref_seconds is None else float(req.max_ref_seconds),
+            "ref_normalize_db": None if req.ref_normalize_db is None else float(req.ref_normalize_db),
+            "ref_ensure_max": bool(req.ref_ensure_max),
+        }
+        return _cache_key_hash(payload)
+
+    def _get_or_encode_caption_condition(
+        self,
+        *,
+        caption_text: str,
+        caption_ids: torch.Tensor | None,
+        caption_mask: torch.Tensor | None,
+        messages: list[str],
+    ) -> EncodedCaptionCondition | None:
+        if not self.model_cfg.use_caption_condition:
+            return None
+        if caption_ids is None or caption_mask is None:
+            raise ValueError("caption_ids/caption_mask are required for caption conditioning.")
+        cache_key = self._caption_condition_cache_key(
+            caption_text=caption_text,
+            caption_ids=caption_ids,
+            caption_mask=caption_mask,
+        )
+        with self._condition_cache_lock:
+            cached = _lru_get(self._caption_condition_cache, cache_key)
+        if isinstance(cached, EncodedCaptionCondition):
+            messages.append("info: reused cached caption encoded state.")
+            return cached
+        if self.model.caption_encoder is None or self.model.caption_norm is None:
+            raise RuntimeError("Caption conditioning is enabled but caption modules are missing.")
+        caption_state = self.model.caption_encoder(caption_ids, caption_mask)
+        caption_state = self.model.caption_norm(caption_state)
+        encoded = EncodedCaptionCondition(state=caption_state, mask=caption_mask)
+        with self._condition_cache_lock:
+            _lru_put(
+                self._caption_condition_cache,
+                cache_key,
+                encoded,
+                max_size=self._condition_cache_max_size,
+            )
+        messages.append("info: cached caption encoded state.")
+        return encoded
+
+    def _get_or_encode_speaker_condition(
+        self,
+        *,
+        ref_latent: torch.Tensor | None,
+        ref_mask: torch.Tensor | None,
+        req: SamplingRequest,
+        messages: list[str],
+    ) -> EncodedSpeakerCondition | None:
+        if not self.model_cfg.use_speaker_condition:
+            return None
+        if ref_latent is None or ref_mask is None:
+            raise ValueError("ref_latent/ref_mask are required for speaker conditioning.")
+        cache_key = self._speaker_condition_cache_key(ref_latent=ref_latent, ref_mask=ref_mask, req=req)
+        if cache_key is not None:
+            with self._condition_cache_lock:
+                cached = _lru_get(self._speaker_condition_cache, cache_key)
+            if isinstance(cached, EncodedSpeakerCondition):
+                messages.append("info: reused cached speaker encoded state.")
+                return cached
+        if self.model.speaker_encoder is None or self.model.speaker_norm is None:
+            raise RuntimeError("Speaker conditioning is enabled but speaker modules are missing.")
+        speaker_latent, speaker_mask = patch_sequence_with_mask(
+            seq=ref_latent,
+            mask=ref_mask,
+            patch_size=self.model_cfg.speaker_patch_size,
+        )
+        speaker_state = self.model.speaker_encoder(speaker_latent, speaker_mask)
+        speaker_state = self.model.speaker_norm(speaker_state)
+        speaker_state, speaker_mask = self.model._prepend_masked_mean_token(
+            speaker_state,
+            speaker_mask,
+        )
+        encoded = EncodedSpeakerCondition(state=speaker_state, mask=speaker_mask)
+        if cache_key is not None:
+            with self._condition_cache_lock:
+                _lru_put(
+                    self._speaker_condition_cache,
+                    cache_key,
+                    encoded,
+                    max_size=self._condition_cache_max_size,
+                )
+            messages.append("info: cached speaker encoded state.")
+        return encoded
 
     @classmethod
     def from_key(cls, key: RuntimeKey) -> InferenceRuntime:
@@ -675,6 +844,9 @@ class InferenceRuntime:
                 log_fn(msg)
 
         messages: list[str] = []
+        self._apply_sampling_preset(req, messages)
+        for msg in messages:
+            _log(msg)
         _log(
             (
                 "[runtime] start synthesize "
@@ -802,13 +974,23 @@ class InferenceRuntime:
                 [normalized_text] * num_candidates,
                 max_length=text_max_len,
             )
+            original_text_len = int(text_ids.shape[1])
+            text_ids, text_mask, trimmed_text_len = _trim_batch_to_masked_length(
+                text_ids,
+                text_mask,
+                min_length=1,
+            )
             stage_sec = _measure_end(self.model_device, t0)
             stage_timings.append(("tokenize_text", stage_sec))
-            _log(f"[runtime] tokenize_text: {stage_sec * 1000.0:.1f} ms")
+            _log(
+                f"[runtime] tokenize_text: {stage_sec * 1000.0:.1f} ms "
+                f"(len {original_text_len} -> {trimmed_text_len})"
+            )
             text_ids = text_ids.to(self.model_device)
             text_mask = text_mask.to(self.model_device)
             caption_ids = None
             caption_mask = None
+            caption_text = ""
             if self.model_cfg.use_caption_condition:
                 if self.caption_tokenizer is None:
                     raise RuntimeError(
@@ -821,6 +1003,13 @@ class InferenceRuntime:
                 )
                 if caption_text == "":
                     caption_mask.zero_()
+                original_caption_len = int(caption_ids.shape[1])
+                caption_ids, caption_mask, trimmed_caption_len = _trim_batch_to_masked_length(
+                    caption_ids,
+                    caption_mask,
+                    min_length=1,
+                )
+                _log(f"[runtime] caption_tokens: len {original_caption_len} -> {trimmed_caption_len}")
                 caption_ids = caption_ids.to(self.model_device)
                 caption_mask = caption_mask.to(self.model_device)
 
@@ -852,6 +1041,36 @@ class InferenceRuntime:
             _log(f"[runtime] prepare_reference: {stage_sec * 1000.0:.1f} ms")
 
             t0 = _measure_start(self.model_device)
+            msg_count_before_conditions = len(messages)
+            text_state = self.model.text_encoder(text_ids, text_mask)
+            text_state = self.model.text_norm(text_state)
+            speaker_encoded = self._get_or_encode_speaker_condition(
+                ref_latent=ref_latent,
+                ref_mask=ref_mask,
+                req=req,
+                messages=messages,
+            )
+            caption_encoded = self._get_or_encode_caption_condition(
+                caption_text=caption_text,
+                caption_ids=caption_ids,
+                caption_mask=caption_mask,
+                messages=messages,
+            )
+            encoded_conditions = (
+                text_state,
+                text_mask,
+                None if speaker_encoded is None else speaker_encoded.state,
+                None if speaker_encoded is None else speaker_encoded.mask,
+                None if caption_encoded is None else caption_encoded.state,
+                None if caption_encoded is None else caption_encoded.mask,
+            )
+            stage_sec = _measure_end(self.model_device, t0)
+            stage_timings.append(("encode_conditions", stage_sec))
+            for msg in messages[msg_count_before_conditions:]:
+                _log(msg)
+            _log(f"[runtime] encode_conditions: {stage_sec * 1000.0:.1f} ms")
+
+            t0 = _measure_start(self.model_device)
             z_patched = sample_euler_rf_cfg(
                 model=self.model,
                 text_input_ids=text_ids,
@@ -876,6 +1095,7 @@ class InferenceRuntime:
                 speaker_kv_scale=speaker_kv_scale,
                 speaker_kv_max_layers=speaker_kv_max_layers,
                 speaker_kv_min_t=speaker_kv_min_t,
+                encoded_conditions=encoded_conditions,
             )
             stage_sec = _measure_end(self.model_device, t0)
             stage_timings.append(("sample_rf", stage_sec))
@@ -1032,3 +1252,48 @@ def save_wav(path: str | Path, audio: torch.Tensor, sample_rate: int) -> Path:
 
         sf.write(str(out_path), audio.squeeze(0).numpy(), sample_rate)
     return out_path
+
+
+def _trim_batch_to_masked_length(
+    ids: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    min_length: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Trim right-padding columns that are fully masked across the batch."""
+    if ids.ndim != 2 or mask.ndim != 2:
+        raise ValueError(f"Expected ids/mask ndim=2, got ids={tuple(ids.shape)} mask={tuple(mask.shape)}")
+    if ids.shape != mask.shape:
+        raise ValueError(f"ids/mask shape mismatch: ids={tuple(ids.shape)} mask={tuple(mask.shape)}")
+    keep_len = int(min_length)
+    if bool(mask.any().item()):
+        keep_len = max(keep_len, int(mask.any(dim=0).nonzero()[-1].item()) + 1)
+    keep_len = max(1, min(int(ids.shape[1]), keep_len))
+    return ids[:, :keep_len].contiguous(), mask[:, :keep_len].contiguous(), keep_len
+
+
+def _lru_get(cache: OrderedDict[str, object], key: str) -> object | None:
+    value = cache.get(key)
+    if value is None:
+        return None
+    cache.move_to_end(key)
+    return value
+
+
+def _lru_put(cache: OrderedDict[str, object], key: str, value: object, *, max_size: int) -> None:
+    cache[key] = value
+    cache.move_to_end(key)
+    while len(cache) > max(1, int(max_size)):
+        cache.popitem(last=False)
+
+
+@dataclass
+class EncodedSpeakerCondition:
+    state: torch.Tensor
+    mask: torch.Tensor
+
+
+@dataclass
+class EncodedCaptionCondition:
+    state: torch.Tensor
+    mask: torch.Tensor

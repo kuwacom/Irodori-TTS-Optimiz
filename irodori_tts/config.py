@@ -171,6 +171,7 @@ class TrainConfig:
 
 @dataclass
 class SamplingConfig:
+    sampling_preset: str | None = None
     num_steps: int = 40
     cfg_scale_text: float = 3.0
     cfg_scale_caption: float = 3.0
