@@ -13,6 +13,19 @@
 
 このフォークで追加した最適化・変更点をここに追記していきます。
 
+### Token / Caption 実長 Trim
+
+推論時の text / caption token を、tokenizer の `max_text_len` / `max_caption_len` そのままではなく、mask 上で実際に使われている末尾位置まで trim するようにしました。
+
+- 対象: `InferenceRuntime.synthesize()` 経由の CLI / Gradio / ランタイム API
+- text: `text_mask` の実長まで `text_ids` / `text_mask` を slice
+- caption: VoiceDesign checkpoint で `caption_mask` の実長まで `caption_ids` / `caption_mask` を slice
+- 空 caption: 互換性のため最小長 1 を維持しつつ mask を全 false にします
+- 効果: 短文推論で text encoder / caption encoder / diffusion joint attention の context 長を削減できます
+
+README 上の default は checkpoint metadata または `256` ですが、実際の文章が短い場合は 256 token 分を常に処理しないため、短文・短い caption の連続生成で特に効きます。
+品質には基本的に影響しない想定です。
+
 ### Reference Audio Latent Cache
 
 Reference Audio を使った推論時に、参照音声を DACVAE latent へエンコードした結果をキャッシュするようにしました。
@@ -34,6 +47,61 @@ Reference Audio を使った推論時に、参照音声を DACVAE latent へエ�
 
 そのため、同じ音声ファイルでも reference の最大秒数や正規化設定を変えると別キャッシュとして扱われます。
 キャッシュは生成物なので Git 管理対象外です。不要になった場合は `./cache/latent/` を削除してください。
+
+### Condition Encoder Cache
+
+Reference Audio latent cache に加えて、推論ランタイム内で speaker / caption の encoder 出力を LRU cache するようにしました。
+
+- 保存場所: メモリ上の `InferenceRuntime` 内 LRU cache
+- cache size: speaker / caption それぞれ最大 32 件
+- speaker cache 対象: reference latent と mask から作る speaker encoded state
+- caption cache 対象: caption text/token/mask から作る caption encoded state
+- 効果: 同じ reference audio や同じ VoiceDesign caption を使った連続生成で、speaker encoder / caption encoder の再計算を省略できます
+
+この cache は runtime unload 時に破棄されます。
+Reference Audio latent cache と違い disk には保存しません。
+
+現時点では encoded state までの cache です。
+各 diffusion layer の projected speaker/caption K/V までを永続的に再利用する分離 cache は、今後の追加最適化候補です。
+
+### Sampling Preset / CFG 高速化
+
+CLI / Gradio / `SamplingRequest` に sampling preset を追加しました。
+`custom` / `quality` は明示指定したパラメータを優先し、`balanced` / `speed` / `extreme` は速度寄りの設定へ展開されます。
+
+| Preset | 主な設定 | 想定用途 |
+| ------ | -------- | -------- |
+| `custom` | CLI / UI / API で指定した値をそのまま使用 | 手動調整 |
+| `quality` | 既存の品質寄り設定を維持 | 品質優先 |
+| `balanced` | `num_steps=30`, `cfg_guidance_mode=alternating`, `cfg_min_t=0.55` | 品質と速度のバランス |
+| `speed` | `num_steps=24`, `cfg_guidance_mode=joint`, `cfg_scale=3.0`, `cfg_min_t=0.6` | 連続生成向け |
+| `extreme` | `num_steps=16`, `cfg_guidance_mode=joint`, `cfg_scale=2.0`, `cfg_min_t=0.7` | 速度最優先 |
+
+使用例:
+
+```bash
+uv run python infer.py \
+  --hf-checkpoint Aratako/Irodori-TTS-500M-v2 \
+  --text "今日はいい天気ですね。" \
+  --ref-wav path/to/reference.wav \
+  --sampling-preset speed \
+  --output-wav outputs/sample_speed.wav
+```
+
+`joint` CFG は複数条件をまとめた uncond pass にするため、`independent` より diffusion forward 回数を抑えられます。
+一方で CFG のかけ方が変わるため、`speed` / `extreme` は品質・話者性・スタイル再現とのトレードオフがあります。
+
+### Context K/V Cache と Speaker K/V Scaling
+
+diffusion sampling 中に固定される text / speaker / caption context の K/V projection を、sampling 前に per-layer cache として構築して使います。
+`--context-kv-cache` は default で有効です。
+
+- 対象: diffusion joint attention の context K/V projection
+- 効果: sampling step ごとの context K/V projection 再計算を省略できます
+- 関連: `--speaker-kv-scale` で speaker K/V を一時的に強調できます
+
+現時点では text / speaker / caption をまとめた context K/V cache です。
+同じ speaker や caption だけを複数リクエストで再利用するには、context K/V を条件ごとに分離する追加実装が必要です。
 
 ### Legacy NVIDIA GPU Support
 
@@ -61,8 +129,11 @@ uv sync --extra legacy-cuda
 
 - REST API 化
 - 生成結果 / reference latent 管理の改善
-- 推論パラメータのプリセット化
-- その他の高速化・省メモリ化
+- condition K/V cache の text / speaker / caption 分離
+- CFG cache の lazy build
+- CFG 用 `x_t` buffer 再利用
+- decode 前 latent trim
+- tail trim 判定の vectorize
 
 ---
 
@@ -256,6 +327,7 @@ uv run python infer.py \
 | `--max-text-len`                   | checkpoint metadata or `256`             | Maximum token length for text conditioning                                                   |
 | `--max-caption-len`                | checkpoint metadata or `max_text_len`    | Maximum token length for caption conditioning                                                |
 | `--num-steps`                      | 40                                       | Number of Euler integration steps                                                            |
+| `--sampling-preset`                | `custom`                                 | Sampling preset: `custom`, `quality`, `balanced`, `speed`, `extreme`                         |
 | `--num-candidates`                 | 1                                        | Number of candidates to generate in one pass                                                 |
 | `--decode-mode`                    | `sequential`                             | Codec decode mode: `sequential` or `batch`                                                   |
 | `--cfg-scale-text`                 | 3.0                                      | CFG scale for text conditioning                                                              |
