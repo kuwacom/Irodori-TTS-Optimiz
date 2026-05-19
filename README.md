@@ -106,7 +106,14 @@ diffusion sampling 中に固定される text / speaker / caption context の K/
 ### CUDA Environment
 
 このブランチは upstream v3 の依存関係に合わせ、通常の `uv sync` では current CUDA / `cu128` 系の PyTorch を使います。
-Pascal 世代 GPU など `cu128` 版 PyTorch が対応しない環境では、別途 PyTorch / Torchaudio の互換バージョンを固定してください。
+Tesla P40 など Pascal 世代 GPU / `sm_61` 系では `cu128` 版 PyTorch が対応しないため、`legacy-cuda` extra を使ってください。
+
+```bash
+uv sync --no-default-groups --extra legacy-cuda
+```
+
+この extra は PyTorch / Torchaudio を `2.5.1` + `cu118` 系に固定します。
+`current-cuda` dependency group は通常環境用に default で有効なため、legacy CUDA 環境では `--no-default-groups` を付けて切り替えてください。
 
 ### 今後追加予定・追記用
 
@@ -180,6 +187,18 @@ uv sync
 ```
 
 **Note**: For Linux/Windows with CUDA, PyTorch is automatically installed from the cu128 index. For macOS (MPS) or CPU-only usage, `uv sync` will install the default PyTorch build.
+
+### Legacy NVIDIA GPU (Tesla P40 / sm_61)
+
+PyTorch `cu128` builds do not support Pascal-generation GPUs such as `Tesla P40` (`sm_61`).
+Use the legacy CUDA extra on those machines:
+
+```bash
+uv sync --no-default-groups --extra legacy-cuda
+```
+
+This extra pins PyTorch / Torchaudio to `2.5.1` from the `cu118` index, which is a better fit for older NVIDIA cards.
+The `current-cuda` dependency group is enabled by default for regular installs, so legacy CUDA installs must disable default groups.
 
 ### Hugging Face cache path
 
