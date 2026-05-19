@@ -2,20 +2,16 @@
 
 # Irodori-TTS-Optimiz
 
-**Irodori-TTS-Optimiz** は、[Aratako/Irodori-TTS](https://github.com/Aratako/Irodori-TTS) をベースにしたフォーク版です。
-本家 Irodori-TTS の v3 コードベースを取り込みつつ、v2 チェックポイント互換性と推論時の実用性・速度改善を維持したフォークです。
+**Irodori-TTS-Optimiz** は、[Aratako/Irodori-TTS](https://github.com/Aratako/Irodori-TTS) をベースにした改善フォークです。
+本家の v3 コードベースを取り込みながら、v2 チェックポイント互換性を保ち、推論時の使い勝手と速度を中心に調整しています。
 
-> [!NOTE]
-> 以降の英語セクションには本家 Irodori-TTS 由来の説明も含まれます。
-> このフォーク独自の変更点は、まずこの日本語セクションの「最適化項目」に追記して管理します。
+## このフォークの変更点
 
-## 最適化項目
-
-このフォークで追加した最適化・変更点をここに追記していきます。
+推論まわりの改善を中心に、次の変更を入れています。
 
 ### Token / Caption 実長 Trim
 
-推論時の text / caption token を、tokenizer の `max_text_len` / `max_caption_len` そのままではなく、mask 上で実際に使われている末尾位置まで trim するようにしました。
+推論時の text / caption token を、tokenizer の `max_text_len` / `max_caption_len` の上限ではなく、mask 上で実際に使われている末尾位置まで trim するようにしています。
 
 - 対象: `InferenceRuntime.synthesize()` 経由の CLI / Gradio / ランタイム API
 - text: `text_mask` の実長まで `text_ids` / `text_mask` を slice
@@ -28,7 +24,7 @@ README 上の default は checkpoint metadata または `256` ですが、実際
 
 ### Reference Audio Latent Cache
 
-Reference Audio を使った推論時に、参照音声を DACVAE latent へエンコードした結果をキャッシュするようにしました。
+Reference Audio を使った推論時に、参照音声を DACVAE latent へエンコードした結果をキャッシュします。
 
 - 保存先: `./cache/latent/`
 - 対象: `ref_wav` を指定した reference audio 推論
@@ -50,7 +46,7 @@ Reference Audio を使った推論時に、参照音声を DACVAE latent へエ�
 
 ### Condition Encoder Cache
 
-Reference Audio latent cache に加えて、推論ランタイム内で speaker / caption の encoder 出力を LRU cache するようにしました。
+Reference Audio latent cache に加えて、推論ランタイム内で speaker / caption の encoder 出力を LRU cache します。
 
 - 保存場所: メモリ上の `InferenceRuntime` 内 LRU cache
 - cache size: speaker / caption それぞれ最大 32 件
@@ -66,16 +62,16 @@ Reference Audio latent cache と違い disk には保存しません。
 
 ### Sampling Preset / CFG 高速化
 
-CLI / Gradio / `SamplingRequest` に sampling preset を追加しました。
+CLI / Gradio / `SamplingRequest` に sampling preset を追加しています。
 `custom` / `quality` は明示指定したパラメータを優先し、`balanced` / `speed` / `extreme` は速度寄りの設定へ展開されます。
 
-| Preset | 主な設定 | 想定用途 |
-| ------ | -------- | -------- |
-| `custom` | CLI / UI / API で指定した値をそのまま使用 | 手動調整 |
-| `quality` | 既存の品質寄り設定を維持 | 品質優先 |
-| `balanced` | `num_steps=30`, `cfg_guidance_mode=alternating`, `cfg_min_t=0.55` | 品質と速度のバランス |
-| `speed` | `num_steps=24`, `cfg_guidance_mode=joint`, `cfg_scale=3.0`, `cfg_min_t=0.6` | 連続生成向け |
-| `extreme` | `num_steps=16`, `cfg_guidance_mode=joint`, `cfg_scale=2.0`, `cfg_min_t=0.7` | 速度最優先 |
+| Preset     | 主な設定                                                                    | 想定用途             |
+| ---------- | --------------------------------------------------------------------------- | -------------------- |
+| `custom`   | CLI / UI / API で指定した値をそのまま使用                                   | 手動調整             |
+| `quality`  | 既存の品質寄り設定を維持                                                    | 品質優先             |
+| `balanced` | `num_steps=30`, `cfg_guidance_mode=alternating`, `cfg_min_t=0.55`           | 品質と速度のバランス |
+| `speed`    | `num_steps=24`, `cfg_guidance_mode=joint`, `cfg_scale=3.0`, `cfg_min_t=0.6` | 連続生成向け         |
+| `extreme`  | `num_steps=16`, `cfg_guidance_mode=joint`, `cfg_scale=2.0`, `cfg_min_t=0.7` | 速度最優先           |
 
 使用例:
 
@@ -105,7 +101,7 @@ diffusion sampling 中に固定される text / speaker / caption context の K/
 
 ### CUDA Environment
 
-このブランチは upstream v3 の依存関係に合わせ、通常の `uv sync` では current CUDA / `cu128` 系の PyTorch を使います。
+このフォークは upstream v3 の依存関係に合わせ、通常の `uv sync` では current CUDA / `cu128` 系の PyTorch を使います。
 Tesla P40 など Pascal 世代 GPU / `sm_61` 系では `cu128` 版 PyTorch が対応しないため、`legacy-cuda` extra を使ってください。
 
 ```bash
@@ -115,7 +111,7 @@ uv sync --no-default-groups --extra legacy-cuda
 この extra は PyTorch / Torchaudio を `2.5.1` + `cu118` 系に固定します。
 `current-cuda` dependency group は通常環境用に default で有効なため、legacy CUDA 環境では `--no-default-groups` を付けて切り替えてください。
 
-### 今後追加予定・追記用
+### 今後の検討項目
 
 - REST API 化
 - 生成結果 / reference latent 管理の改善
@@ -181,8 +177,8 @@ Audio is represented as continuous latent sequences via the codec configured by 
 ## Installation
 
 ```bash
-git clone https://github.com/Aratako/Irodori-TTS.git
-cd Irodori-TTS
+git clone https://github.com/kuwacom/Irodori-TTS-Optimiz.git
+cd Irodori-TTS-Optimiz
 uv sync
 ```
 
