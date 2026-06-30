@@ -9,7 +9,7 @@ import threading
 import time
 from collections import OrderedDict
 from collections.abc import Callable
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -79,7 +79,14 @@ def list_available_runtime_precisions(device: str | torch.device) -> list[str]:
     return ["fp32"]
 
 
-def _sync_device(device: torch.device) -> None:
+# 並列推論 (Parallel) 時はタイミング計測のグローバル同期をスキップするかどうか
+# True なら _measure_start/_measure_end で cuda.synchronize を呼ばない
+_SKIP_TIMING_SYNC: bool = False
+
+
+def _sync_device(device: torch.device, *, skip_if_parallel: bool = False) -> None:
+    if skip_if_parallel and _SKIP_TIMING_SYNC:
+        return
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     elif device.type == "mps":
@@ -88,23 +95,23 @@ def _sync_device(device: torch.device) -> None:
             mps.synchronize()
 
 
-def _sync_devices(*devices: torch.device) -> None:
+def _sync_devices(*devices: torch.device, skip_if_parallel: bool = False) -> None:
     seen: set[tuple[str, int | None]] = set()
     for device in devices:
         key = (device.type, device.index)
         if key in seen:
             continue
-        _sync_device(device)
+        _sync_device(device, skip_if_parallel=skip_if_parallel)
         seen.add(key)
 
 
 def _measure_start(device: torch.device, *extra_devices: torch.device) -> float:
-    _sync_devices(device, *extra_devices)
+    _sync_devices(device, *extra_devices, skip_if_parallel=True)
     return time.perf_counter()
 
 
 def _measure_end(device: torch.device, t0: float, *extra_devices: torch.device) -> float:
-    _sync_devices(device, *extra_devices)
+    _sync_devices(device, *extra_devices, skip_if_parallel=True)
     return time.perf_counter() - t0
 
 
@@ -450,6 +457,39 @@ def _load_checkpoint_for_inference(
     return _load_checkpoint_from_pt(path)
 
 
+
+class _InferenceScope:
+    """並列推論スコープのライフタイムを管理するコンテキストマネージャ
+
+    セマフォ取得 → LoRA context enter → inference_mode → CUDA Stream の順で
+    コンテキストを構築し、__exit__ で逆順にクリーンアップする
+    """
+
+    def __init__(
+        self,
+        runtime: InferenceRuntime,
+        lora_ctx: Any,
+    ) -> None:
+        self._runtime = runtime
+        self._lora_ctx = lora_ctx
+        self._stream_ctx: Any = None
+
+    def __enter__(self) -> "_InferenceScope":
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> bool:
+        # CUDA Stream のクリーンアップ
+        if self._stream_ctx is not None:
+            self._stream_ctx.__exit__(exc_type, exc_val, exc_tb)
+            self._stream_ctx = None
+        # LoRA context のクリーンアップ
+        if self._lora_ctx is not None:
+            self._lora_ctx.__exit__(exc_type, exc_val, exc_tb)
+            self._lora_ctx = None
+        # セマフォの解放
+        self._runtime._release_inference_slot()
+        return False
+
 class InferenceRuntime:
     def __init__(
         self,
@@ -463,6 +503,7 @@ class InferenceRuntime:
         codec: DACVAECodec,
         default_text_max_len: int,
         default_caption_max_len: int,
+        max_parallelism: int = 1,
     ) -> None:
         self.key = key
         self.model_device = resolve_runtime_device(key.model_device)
@@ -476,13 +517,95 @@ class InferenceRuntime:
         self.default_text_max_len = default_text_max_len
         self.default_caption_max_len = default_caption_max_len
         self.watermarker = SilentCipherWatermarker(device=str(self.codec_device))
-        self._infer_lock = threading.Lock()
+        # 並列推論 (Parallel) 設定
+        max_par = max(1, int(max_parallelism))
+        self._max_parallelism: int = max_par
+        self._max_parallelism_lock = threading.Lock()
+        self._infer_semaphore = threading.Semaphore(max_par)
+        # LoRA アダプタ切り替えは排他制御が必要なため Lock を維持
+        # ただし LoRA context manager のライフタイム全体を保持してはならない
+        # (設定変更の瞬間だけ排他にする)
+        self._lora_lock = threading.Lock()
         self._condition_cache_lock = threading.Lock()
         self._speaker_condition_cache: OrderedDict[str, EncodedSpeakerCondition] = OrderedDict()
         self._caption_condition_cache: OrderedDict[str, EncodedCaptionCondition] = OrderedDict()
         self._condition_cache_max_size = 32
         self._model_dtype = next(self.model.parameters()).dtype
         self._lora_adapter_names: dict[str, str] = {}
+        # CUDA Stream プール: max_parallelism に応じて事前構築
+        self._cuda_streams: list[torch.cuda.Stream | None] = []
+        if self.model_device.type == "cuda" and max_par > 1:
+            self._cuda_streams = [torch.cuda.Stream(device=self.model_device) for _ in range(max_par)]
+        # スレッドローカルでワーカーIDを管理し、CUDA Stream を割り当て
+        self._worker_id_counter: int = 0
+        self._worker_id_lock = threading.Lock()
+        # RoPE キャッシュの事前確保: 並列推論時の上書き競合を防ぐ
+        self._rope_max_seq_len: int = 4096
+        self.model.prewarm_rope_cache(self._rope_max_seq_len)
+        # 並列数 2 以上ならタイミング計測の同期をスキップ (スループット向上)
+        global _SKIP_TIMING_SYNC
+        _SKIP_TIMING_SYNC = max_par > 1
+
+    def _acquire_inference_slot(self) -> int:
+        """セマフォを取得し、ワーカーIDを返す。CUDA Stream 割り当てに使用"""
+        self._infer_semaphore.acquire()
+        with self._worker_id_lock:
+            wid = self._worker_id_counter
+            self._worker_id_counter = (wid + 1) % max(1, len(self._cuda_streams)) if self._cuda_streams else 0
+        return wid
+
+    def _release_inference_slot(self) -> None:
+        """並列推論スロットを解放する"""
+        self._infer_semaphore.release()
+
+    def _inference_stream(self, worker_id: int) -> Any:
+        """推論用 CUDA Stream コンテキストマネージャを返す
+
+        CUDA が利用できない場合は nullcontext を返すため、
+        非CUDA環境でも透過的に動作する
+        """
+        if not self._cuda_streams:
+            return nullcontext()
+        stream = self._cuda_streams[worker_id] if worker_id < len(self._cuda_streams) else None
+        if stream is None:
+            return nullcontext()
+        return torch.cuda.stream(stream)
+
+    @property
+    def max_parallelism(self) -> int:
+        """現在の最大並列推論数"""
+        with self._max_parallelism_lock:
+            return self._max_parallelism
+
+    def _rebuild_cuda_streams(self, count: int) -> None:
+        """CUDA Stream プールを再構築"""
+        if self.model_device.type == "cuda" and count > 1:
+            self._cuda_streams = [torch.cuda.Stream(device=self.model_device) for _ in range(count)]
+        else:
+            self._cuda_streams = []
+
+    def set_max_parallelism(self, value: int) -> None:
+        """並列推論数を動的に変更
+
+        実行中のリクエストがある場合でも安全に変更可能:
+        - セマフォは再作成して新しい上限を反映
+        - CUDA Stream プールは即座に再構築される
+
+        @param value - 新しい最大並列実行数 (1以上)
+        """
+        new_max = max(1, int(value))
+        with self._max_parallelism_lock:
+            if new_max == self._max_parallelism:
+                return
+            self._max_parallelism = new_max
+        # セマフォを再作成: 実行中スレッドが保持している古いセマフォは
+        # release されると自然に消費される。新しいセマフォは新しい上限で機能する
+        self._infer_semaphore = threading.Semaphore(new_max)
+        # CUDA Stream プールの再構築
+        self._rebuild_cuda_streams(new_max)
+        # 並列数 2 以上ならタイミング計測の同期をスキップ (スループット向上)
+        global _SKIP_TIMING_SYNC
+        _SKIP_TIMING_SYNC = new_max > 1
 
     def _apply_sampling_preset(self, req: SamplingRequest, messages: list[str]) -> None:
         preset = "quality" if req.sampling_preset is None else str(req.sampling_preset).strip().lower()
@@ -652,7 +775,7 @@ class InferenceRuntime:
         return encoded
 
     @classmethod
-    def from_key(cls, key: RuntimeKey) -> InferenceRuntime:
+    def from_key(cls, key: RuntimeKey, *, max_parallelism: int = 1) -> InferenceRuntime:
         model_device = resolve_runtime_device(key.model_device)
         codec_device = resolve_runtime_device(key.codec_device)
         model_dtype = resolve_runtime_dtype(
@@ -737,6 +860,7 @@ class InferenceRuntime:
             codec=codec,
             default_text_max_len=default_text_max_len,
             default_caption_max_len=default_caption_max_len,
+            max_parallelism=max_parallelism,
         )
 
     def _reference_latent_cache_path(self, *, req: SamplingRequest) -> Path | None:
@@ -1176,16 +1300,26 @@ class InferenceRuntime:
             _log(f"[runtime] using seed: {used_seed}")
         post_load_t0 = _measure_start(self.model_device, self.codec_device)
 
-        with (
-            self._infer_lock,
-            self._prepare_lora_for_request(
+        # LoRA アダプタの設定は排他制御 (同じモデル重みを共有するため並列アダプタ変更不可)
+        # ただしロックは設定の瞬間だけ: context manager のライフタイム全体は保持しない
+        with self._lora_lock:
+            lora_ctx = self._prepare_lora_for_request(
                 req.lora_adapter,
                 messages=messages,
                 stage_timings=stage_timings,
                 log_fn=_log,
-            ),
-            torch.inference_mode(),
-        ):
+            )
+        # _lora_lock はここで解放: 設定完了後は並列推論 (Parallel) 可能
+
+        # 並列推論スロット取得 → LoRA/inference_mode/stream を一括管理
+        worker_id = self._acquire_inference_slot()
+        scope = _InferenceScope(self, lora_ctx)
+        with scope, torch.inference_mode():
+            stream_ctx = self._inference_stream(worker_id)
+            if stream_ctx is not None:
+                stream_ctx.__enter__()
+                scope._stream_ctx = stream_ctx
+            # --- 以下、推論本体 ---
             t0 = _measure_start(self.model_device)
             text_ids, text_mask = self.tokenizer.batch_encode(
                 [normalized_text] * num_candidates,
@@ -1500,6 +1634,7 @@ class InferenceRuntime:
             total_to_decode = _measure_end(self.model_device, post_load_t0, self.codec_device)
             _log(f"[runtime] total_to_decode: {total_to_decode:.3f} s")
 
+        # _InferenceScope.__exit__ がセマフォ解放・Stream終了・LoRA終了を処理
         _log("[runtime] done synthesize")
         return SamplingResult(
             audio=trimmed_audios[0],
@@ -1530,14 +1665,18 @@ _RUNTIME_CACHE_KEY: RuntimeKey | None = None
 _RUNTIME_CACHE_VALUE: InferenceRuntime | None = None
 
 
-def get_cached_runtime(key: RuntimeKey) -> tuple[InferenceRuntime, bool]:
+def get_cached_runtime(key: RuntimeKey, *, max_parallelism: int = 1) -> tuple[InferenceRuntime, bool]:
     global _RUNTIME_CACHE_KEY, _RUNTIME_CACHE_VALUE
     with _RUNTIME_CACHE_LOCK:
         if _RUNTIME_CACHE_VALUE is not None and _RUNTIME_CACHE_KEY == key:
-            return _RUNTIME_CACHE_VALUE, False
+            runtime = _RUNTIME_CACHE_VALUE
+            # キャッシュヒット時も max_parallelism が異なれば並列数を動的に反映
+            if max_parallelism > 1 and runtime.max_parallelism != max(1, int(max_parallelism)):
+                runtime.set_max_parallelism(int(max_parallelism))
+            return runtime, False
 
         old_runtime = _RUNTIME_CACHE_VALUE
-        runtime = InferenceRuntime.from_key(key)
+        runtime = InferenceRuntime.from_key(key, max_parallelism=max_parallelism)
         _RUNTIME_CACHE_KEY = key
         _RUNTIME_CACHE_VALUE = runtime
 

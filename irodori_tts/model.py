@@ -1360,6 +1360,16 @@ class TextToLatentRFDiT(nn.Module):
             self._freqs_cis_cache = cache
         return cache[:seq_len]
 
+    def prewarm_rope_cache(self, max_seq_len: int = 4096) -> None:
+        """推論前に全 RoPE キャッシュを最大長で事前確保。並列推論時の上書き競合を防ぐ"""
+        device = self.device
+        self._rope_freqs(max_seq_len, device)
+        self.text_encoder._rope_freqs(max_seq_len, device)
+        if self.caption_encoder is not None:
+            self.caption_encoder._rope_freqs(max_seq_len, device)
+        if self.speaker_encoder is not None:
+            self.speaker_encoder._rope_freqs(max_seq_len, device)
+
     @staticmethod
     def _prepend_masked_mean_token(
         state: torch.Tensor,

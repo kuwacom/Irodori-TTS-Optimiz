@@ -187,6 +187,7 @@ def _load_model(
     model_precision: str,
     codec_device: str,
     codec_precision: str,
+    max_parallelism: int = 1,
 ) -> str:
     runtime_key = _build_runtime_key(
         checkpoint=checkpoint,
@@ -195,7 +196,8 @@ def _load_model(
         codec_device=codec_device,
         codec_precision=codec_precision,
     )
-    _, reloaded = get_cached_runtime(runtime_key)
+    runtime, reloaded = get_cached_runtime(runtime_key)
+    runtime.set_max_parallelism(int(max_parallelism))
     if reloaded:
         status = "loaded model into memory"
     else:
@@ -206,7 +208,8 @@ def _load_model(
         f"model_device: {runtime_key.model_device}\n"
         f"model_precision: {runtime_key.model_precision}\n"
         f"codec_device: {runtime_key.codec_device}\n"
-        f"codec_precision: {runtime_key.codec_precision}"
+        f"codec_precision: {runtime_key.codec_precision}\n"
+        f"max_parallelism: {runtime.max_parallelism}"
     )
 
 
@@ -242,6 +245,7 @@ def _run_generation(
     speaker_kv_min_t_raw: str,
     speaker_kv_max_layers_raw: str,
     lora_adapter_raw: str,
+    max_parallelism: int = 1,
 ) -> tuple[object, ...]:
     def stdout_log(msg: str) -> None:
         print(msg, flush=True)
@@ -285,6 +289,7 @@ def _run_generation(
     ref_ensure_max = True
 
     runtime, reloaded = get_cached_runtime(runtime_key)
+    runtime.set_max_parallelism(int(max_parallelism))
     stdout_log(f"[gradio] runtime: {'reloaded' if reloaded else 'reused'}")
     stdout_log(
         (
@@ -428,6 +433,14 @@ def build_ui() -> gr.Blocks:
                 label="Codec Precision",
                 choices=codec_precision_choices,
                 value=codec_precision_choices[0],
+                scale=1,
+            )
+            max_parallelism = gr.Slider(
+                label="Max Parallelism",
+                minimum=1,
+                maximum=8,
+                value=1,
+                step=1,
                 scale=1,
             )
 
@@ -601,6 +614,7 @@ def build_ui() -> gr.Blocks:
                 speaker_kv_min_t_raw,
                 speaker_kv_max_layers_raw,
                 lora_adapter_raw,
+                max_parallelism,
             ],
             outputs=[*out_audios, out_log, out_timing],
         )
@@ -622,6 +636,7 @@ def build_ui() -> gr.Blocks:
                 model_precision,
                 codec_device,
                 codec_precision,
+                max_parallelism,
             ],
             outputs=[clear_cache_msg],
         )
@@ -639,7 +654,8 @@ def main() -> None:
     args = parser.parse_args()
 
     demo = build_ui()
-    demo.queue(default_concurrency_limit=1)
+    # 並列推論を有効にするためイベントの同時実行数上限を設定
+    demo.queue(max_size=20, default_concurrency_limit=8)
     demo.launch(
         server_name=args.server_name,
         server_port=args.server_port,
