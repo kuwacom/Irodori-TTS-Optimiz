@@ -79,7 +79,10 @@ def list_available_runtime_precisions(device: str | torch.device) -> list[str]:
     return ["fp32"]
 
 
-def _sync_device(device: torch.device) -> None:
+
+def _sync_device(device: torch.device, *, skip_timing_sync: bool = False) -> None:
+    if skip_timing_sync:
+        return
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     elif device.type == "mps":
@@ -88,23 +91,23 @@ def _sync_device(device: torch.device) -> None:
             mps.synchronize()
 
 
-def _sync_devices(*devices: torch.device) -> None:
+def _sync_devices(*devices: torch.device, skip_timing_sync: bool = False) -> None:
     seen: set[tuple[str, int | None]] = set()
     for device in devices:
         key = (device.type, device.index)
         if key in seen:
             continue
-        _sync_device(device)
+        _sync_device(device, skip_timing_sync=skip_timing_sync)
         seen.add(key)
 
 
-def _measure_start(device: torch.device, *extra_devices: torch.device) -> float:
-    _sync_devices(device, *extra_devices)
+def _measure_start(device: torch.device, *extra_devices: torch.device, skip_timing_sync: bool = False) -> float:
+    _sync_devices(device, *extra_devices, skip_timing_sync=skip_timing_sync)
     return time.perf_counter()
 
 
-def _measure_end(device: torch.device, t0: float, *extra_devices: torch.device) -> float:
-    _sync_devices(device, *extra_devices)
+def _measure_end(device: torch.device, t0: float, *extra_devices: torch.device, skip_timing_sync: bool = False) -> float:
+    _sync_devices(device, *extra_devices, skip_timing_sync=skip_timing_sync)
     return time.perf_counter() - t0
 
 
@@ -450,6 +453,54 @@ def _load_checkpoint_for_inference(
     return _load_checkpoint_from_pt(path)
 
 
+
+class _InferenceScope:
+    """並列推論スコープのライフタイムを管理するコンテキストマネージャ
+
+    __enter__ で LoRA context enter → CUDA Stream enter を順に構築し、
+    __exit__ で逆順にクリーンアップする。セマフォは acquire した
+    オブジェクトを保持して release するため、set_max_parallelism で
+    セマフォが再作成されても安全
+    """
+
+    def __init__(
+        self,
+        runtime: InferenceRuntime,
+        lora_ctx: Any,
+        worker_id: int,
+        semaphore: threading.Semaphore,
+    ) -> None:
+        self._runtime = runtime
+        self._lora_ctx = lora_ctx
+        self._worker_id = worker_id
+        self._semaphore = semaphore
+        self._stream_ctx: Any = None
+
+    def __enter__(self) -> "_InferenceScope":
+        # LoRA context を開始
+        self._lora_ctx.__enter__()
+        # CUDA Stream を開始
+        self._stream_ctx = self._runtime._inference_stream(self._worker_id)
+        if self._stream_ctx is not None:
+            self._stream_ctx.__enter__()
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> bool:
+        # CUDA Stream のクリーンアップ
+        if self._stream_ctx is not None:
+            self._stream_ctx.__exit__(exc_type, exc_val, exc_tb)
+            self._stream_ctx = None
+        # LoRA context のクリーンアップ
+        if self._lora_ctx is not None:
+            self._lora_ctx.__exit__(exc_type, exc_val, exc_tb)
+            self._lora_ctx = None
+        # セマフォを解放 (取得したオブジェクトを release する)
+        self._semaphore.release()
+        # 実行中スレッド数をデクリメント
+        with self._runtime._active_count_lock:
+            self._runtime._active_count -= 1
+        return False
+
 class InferenceRuntime:
     def __init__(
         self,
@@ -463,6 +514,7 @@ class InferenceRuntime:
         codec: DACVAECodec,
         default_text_max_len: int,
         default_caption_max_len: int,
+        max_parallelism: int = 1,
     ) -> None:
         self.key = key
         self.model_device = resolve_runtime_device(key.model_device)
@@ -476,13 +528,116 @@ class InferenceRuntime:
         self.default_text_max_len = default_text_max_len
         self.default_caption_max_len = default_caption_max_len
         self.watermarker = SilentCipherWatermarker(device=str(self.codec_device))
-        self._infer_lock = threading.Lock()
+        # 並列推論 (Parallel) 設定
+        max_par = max(1, int(max_parallelism))
+        self._max_parallelism: int = max_par
+        self._max_parallelism_lock = threading.Lock()
+        self._infer_semaphore = threading.Semaphore(max_par)
+        # 現在実行中のスレッド数 (set_max_parallelism でセマフォ正規化に使用)
+        self._active_count: int = 0
+        self._active_count_lock = threading.Lock()
+        # LoRA アダプタ切り替えは排他制御が必要なため Lock を維持
+        # ただし LoRA context manager のライフタイム全体を保持してはならない
+        # (設定変更の瞬間だけ排他にする)
+        # WARNING: LoRA 使用時の並列安全性は完全ではない。
+        # load_lora_adapter は model のモジュール構成を書き換えるため、
+        # 書き換え中に別スレッドが forward を実行すると壊れる可能性がある。
+        # 現状は _lora_lock で書き換えの瞬間だけ排他しているが、
+        # 本来は LoRA 併用時は並列数を 1 に制限するか推論全体をシリアライズすべき
+        self._lora_lock = threading.Lock()
         self._condition_cache_lock = threading.Lock()
         self._speaker_condition_cache: OrderedDict[str, EncodedSpeakerCondition] = OrderedDict()
         self._caption_condition_cache: OrderedDict[str, EncodedCaptionCondition] = OrderedDict()
         self._condition_cache_max_size = 32
         self._model_dtype = next(self.model.parameters()).dtype
         self._lora_adapter_names: dict[str, str] = {}
+        # CUDA Stream プール: max_parallelism に応じて事前構築
+        self._cuda_streams: list[torch.cuda.Stream | None] = []
+        if self.model_device.type == "cuda" and max_par > 1:
+            self._cuda_streams = [torch.cuda.Stream(device=self.model_device) for _ in range(max_par)]
+        # スレッドローカルでワーカーIDを管理し、CUDA Stream を割り当て
+        self._worker_id_counter: int = 0
+        self._worker_id_lock = threading.Lock()
+        # RoPE キャッシュの事前確保: 並列推論時の上書き競合を防ぐ
+        self._rope_max_seq_len: int = 4096
+        self.model.prewarm_rope_cache(self._rope_max_seq_len)
+        # 並列数 2 以上ならタイミング計測の同期をスキップ (スループット向上)
+        self._skip_timing_sync: bool = max_par > 1
+
+    def _acquire_inference_slot(self) -> tuple[int, threading.Semaphore]:
+        """並列推論スロットを取得し、ワーカーIDとセマフォオブジェクトを返す
+
+        セマフォオブジェクトを返すことで、set_max_parallelism でセマフォが
+        再作成された場合でも、実行中スレッドが正しいセマフォを release する。
+        NOTE: self._infer_semaphore の読み取りと acquire の間に
+        set_max_parallelism が挟まるレースが理論上存在するが、
+        古いセマフォの release は無害であり、新しいセマフォが
+        _active_count 分のスロットを予約済みのため実用上問題ない
+        """
+        semaphore = self._infer_semaphore
+        semaphore.acquire()
+        with self._active_count_lock:
+            self._active_count += 1
+        with self._worker_id_lock:
+            wid = self._worker_id_counter
+            self._worker_id_counter = (wid + 1) % max(1, len(self._cuda_streams)) if self._cuda_streams else 0
+        return wid, semaphore
+
+    def _inference_stream(self, worker_id: int) -> Any:
+        """推論用 CUDA Stream コンテキストマネージャを返す
+
+        CUDA が利用できない場合は nullcontext を返すため、
+        非CUDA環境でも透過的に動作する
+        """
+        if not self._cuda_streams:
+            return nullcontext()
+        stream = self._cuda_streams[worker_id] if worker_id < len(self._cuda_streams) else None
+        if stream is None:
+            return nullcontext()
+        return torch.cuda.stream(stream)
+
+    @property
+    def max_parallelism(self) -> int:
+        """現在の最大並列推論数"""
+        with self._max_parallelism_lock:
+            return self._max_parallelism
+
+    def _rebuild_cuda_streams(self, count: int) -> None:
+        """CUDA Stream プールを再構築"""
+        if self.model_device.type == "cuda" and count > 1:
+            self._cuda_streams = [torch.cuda.Stream(device=self.model_device) for _ in range(count)]
+        else:
+            self._cuda_streams = []
+
+    def set_max_parallelism(self, value: int) -> None:
+        """並列推論数を動的に変更
+
+        実行中のリクエストがある場合でも安全に変更可能:
+        - セマフォは再作成して新しい上限を反映
+        - CUDA Stream プールは即座に再構築される
+
+        @param value - 新しい最大並列実行数 (1以上)
+        """
+        new_max = max(1, int(value))
+        with self._max_parallelism_lock:
+            if new_max == self._max_parallelism:
+                return
+            self._max_parallelism = new_max
+        # セマフォを安全に再構築:
+        # 実行中スレッド (active) は新しいセマフォのスロットを占有しているとみなす
+        # Semaphore(new_max + active) で作成し、即座に active 分を acquire して予約する
+        # これにより残りの利用可能スロット = new_max となり、並列数減時も安全に動作する
+        # 実行中スレッドが古いセマフォを release しても、それは誰も acquire しないため無害
+        with self._active_count_lock:
+            active = self._active_count
+        new_semaphore = threading.Semaphore(new_max + active)
+        for _ in range(active):
+            new_semaphore.acquire()
+        self._infer_semaphore = new_semaphore
+        # CUDA Stream プールの再構築
+        self._rebuild_cuda_streams(new_max)
+        # 並列数 2 以上ならタイミング計測の同期をスキップ (スループット向上)
+        self._skip_timing_sync = new_max > 1
 
     def _apply_sampling_preset(self, req: SamplingRequest, messages: list[str]) -> None:
         preset = "quality" if req.sampling_preset is None else str(req.sampling_preset).strip().lower()
@@ -652,7 +807,7 @@ class InferenceRuntime:
         return encoded
 
     @classmethod
-    def from_key(cls, key: RuntimeKey) -> InferenceRuntime:
+    def from_key(cls, key: RuntimeKey, *, max_parallelism: int = 1) -> InferenceRuntime:
         model_device = resolve_runtime_device(key.model_device)
         codec_device = resolve_runtime_device(key.codec_device)
         model_dtype = resolve_runtime_dtype(
@@ -737,6 +892,7 @@ class InferenceRuntime:
             codec=codec,
             default_text_max_len=default_text_max_len,
             default_caption_max_len=default_caption_max_len,
+            max_parallelism=max_parallelism,
         )
 
     def _reference_latent_cache_path(self, *, req: SamplingRequest) -> Path | None:
@@ -1174,19 +1330,25 @@ class InferenceRuntime:
         else:
             used_seed = int(req.seed)
             _log(f"[runtime] using seed: {used_seed}")
-        post_load_t0 = _measure_start(self.model_device, self.codec_device)
-
-        with (
-            self._infer_lock,
-            self._prepare_lora_for_request(
+        # LoRA アダプタの設定は排他制御 (同じモデル重みを共有するため並列アダプタ変更不可)
+        # ただしロックは設定の瞬間だけ: context manager のライフタイム全体は保持しない
+        with self._lora_lock:
+            lora_ctx = self._prepare_lora_for_request(
                 req.lora_adapter,
                 messages=messages,
                 stage_timings=stage_timings,
                 log_fn=_log,
-            ),
-            torch.inference_mode(),
-        ):
-            t0 = _measure_start(self.model_device)
+            )
+        # _lora_lock はここで解放: 設定完了後は並列推論 (Parallel) 可能
+
+        # 並列推論スロット取得 → LoRA/Stream を一括管理
+        worker_id, semaphore = self._acquire_inference_slot()
+        # スロット確保後から total_to_decode 計測開始 (セマフォ待ち時間を除外)
+        post_load_t0 = _measure_start(self.model_device, self.codec_device, skip_timing_sync=self._skip_timing_sync)
+        scope = _InferenceScope(self, lora_ctx, worker_id, semaphore)
+        with scope, torch.inference_mode():
+            # --- 以下、推論本体 ---
+            t0 = _measure_start(self.model_device, skip_timing_sync=self._skip_timing_sync)
             text_ids, text_mask = self.tokenizer.batch_encode(
                 [normalized_text] * num_candidates,
                 max_length=text_max_len,
@@ -1197,7 +1359,7 @@ class InferenceRuntime:
                 text_mask,
                 min_length=1,
             )
-            stage_sec = _measure_end(self.model_device, t0)
+            stage_sec = _measure_end(self.model_device, t0, skip_timing_sync=self._skip_timing_sync)
             stage_timings.append(("tokenize_text", stage_sec))
             _log(
                 f"[runtime] tokenize_text: {stage_sec * 1000.0:.1f} ms "
@@ -1230,7 +1392,7 @@ class InferenceRuntime:
                 caption_ids = caption_ids.to(self.model_device)
                 caption_mask = caption_mask.to(self.model_device)
 
-            t0 = _measure_start(self.model_device, self.codec_device)
+            t0 = _measure_start(self.model_device, self.codec_device, skip_timing_sync=self._skip_timing_sync)
             msg_count_before_ref = len(messages)
             (
                 speaker_state_override,
@@ -1248,7 +1410,7 @@ class InferenceRuntime:
                 )
             else:
                 ref_latent, ref_mask = None, None
-            stage_sec = _measure_end(self.model_device, t0, self.codec_device)
+            stage_sec = _measure_end(self.model_device, t0, self.codec_device, skip_timing_sync=self._skip_timing_sync)
             stage_timings.append(("prepare_reference", stage_sec))
             for msg in messages[msg_count_before_ref:]:
                 _log(msg)
@@ -1270,7 +1432,7 @@ class InferenceRuntime:
                 messages.append(duration_msg)
                 _log(duration_msg)
             elif self.model_cfg.use_duration_predictor:
-                t0 = _measure_start(self.model_device)
+                t0 = _measure_start(self.model_device, skip_timing_sync=self._skip_timing_sync)
                 has_speaker_duration = torch.zeros(
                     (num_candidates,), dtype=torch.bool, device=self.model_device
                 )
@@ -1327,7 +1489,7 @@ class InferenceRuntime:
                 latent_steps = int(round(scaled_frames))
                 latent_steps = max(min_frames, min(max_frames, latent_steps))
                 target_samples = int(latent_steps * hop_length)
-                stage_sec = _measure_end(self.model_device, t0)
+                stage_sec = _measure_end(self.model_device, t0, skip_timing_sync=self._skip_timing_sync)
                 stage_timings.append(("predict_duration", stage_sec))
                 msg = (
                     f"info: predicted duration frames={pred_frames:.1f}, "
@@ -1356,7 +1518,7 @@ class InferenceRuntime:
                     messages.append(msg)
                     _log(msg)
 
-            t0 = _measure_start(self.model_device)
+            t0 = _measure_start(self.model_device, skip_timing_sync=self._skip_timing_sync)
             msg_count_before_conditions = len(messages)
             text_state = self.model.text_encoder(text_ids, text_mask)
             text_state = self.model.text_norm(text_state)
@@ -1386,13 +1548,13 @@ class InferenceRuntime:
                 None if caption_encoded is None else caption_encoded.state,
                 None if caption_encoded is None else caption_encoded.mask,
             )
-            stage_sec = _measure_end(self.model_device, t0)
+            stage_sec = _measure_end(self.model_device, t0, skip_timing_sync=self._skip_timing_sync)
             stage_timings.append(("encode_conditions", stage_sec))
             for msg in messages[msg_count_before_conditions:]:
                 _log(msg)
             _log(f"[runtime] encode_conditions: {stage_sec * 1000.0:.1f} ms")
 
-            t0 = _measure_start(self.model_device)
+            t0 = _measure_start(self.model_device, skip_timing_sync=self._skip_timing_sync)
             z_patched = sample_euler_rf_cfg(
                 model=self.model,
                 text_input_ids=text_ids,
@@ -1424,22 +1586,22 @@ class InferenceRuntime:
                 t_schedule_mode=str(req.t_schedule_mode),
                 sway_coeff=float(req.sway_coeff),
             )
-            stage_sec = _measure_end(self.model_device, t0)
+            stage_sec = _measure_end(self.model_device, t0, skip_timing_sync=self._skip_timing_sync)
             stage_timings.append(("sample_rf", stage_sec))
             _log(f"[runtime] sample_rf: {stage_sec * 1000.0:.1f} ms")
 
-            t0 = _measure_start(self.model_device)
+            t0 = _measure_start(self.model_device, skip_timing_sync=self._skip_timing_sync)
             z = unpatchify_latent(
                 z_patched,
                 patch_size=self.model_cfg.latent_patch_size,
                 latent_dim=self.model_cfg.latent_dim,
             )
-            stage_sec = _measure_end(self.model_device, t0)
+            stage_sec = _measure_end(self.model_device, t0, skip_timing_sync=self._skip_timing_sync)
             stage_timings.append(("unpatchify_latent", stage_sec))
             _log(f"[runtime] unpatchify_latent: {stage_sec * 1000.0:.1f} ms")
             z = z[:, :latent_steps]
 
-            t0 = _measure_start(self.model_device, self.codec_device)
+            t0 = _measure_start(self.model_device, self.codec_device, skip_timing_sync=self._skip_timing_sync)
             trimmed_audios: list[torch.Tensor] = []
             if decode_mode == "batch":
                 audio_batch = self.codec.decode_latent(z).cpu()
@@ -1476,17 +1638,17 @@ class InferenceRuntime:
                         if flattening_samples > 0:
                             max_samples = min(max_samples, flattening_samples)
                     trimmed_audios.append(audio_i[:, :max_samples])
-            stage_sec = _measure_end(self.model_device, t0, self.codec_device)
+            stage_sec = _measure_end(self.model_device, t0, self.codec_device, skip_timing_sync=self._skip_timing_sync)
             stage_timings.append(("decode_latent", stage_sec))
             _log(f"[runtime] decode_latent ({decode_mode}): {stage_sec * 1000.0:.1f} ms")
 
             if self.watermarker.ready:
-                t0 = _measure_start(self.codec_device)
+                t0 = _measure_start(self.codec_device, skip_timing_sync=self._skip_timing_sync)
                 trimmed_audios = self.watermarker.encode_batch(
                     trimmed_audios,
                     sample_rate=int(self.codec.sample_rate),
                 )
-                stage_sec = _measure_end(self.codec_device, t0)
+                stage_sec = _measure_end(self.codec_device, t0, skip_timing_sync=self._skip_timing_sync)
                 stage_timings.append(("silentcipher_watermark", stage_sec))
                 _log(f"[runtime] silentcipher_watermark: {stage_sec * 1000.0:.1f} ms")
             else:
@@ -1497,9 +1659,10 @@ class InferenceRuntime:
                 messages.append(msg)
                 _log(msg)
 
-            total_to_decode = _measure_end(self.model_device, post_load_t0, self.codec_device)
+            total_to_decode = _measure_end(self.model_device, post_load_t0, self.codec_device, skip_timing_sync=self._skip_timing_sync)
             _log(f"[runtime] total_to_decode: {total_to_decode:.3f} s")
 
+        # _InferenceScope.__exit__ がセマフォ解放・Stream終了・LoRA終了を処理
         _log("[runtime] done synthesize")
         return SamplingResult(
             audio=trimmed_audios[0],
@@ -1530,14 +1693,18 @@ _RUNTIME_CACHE_KEY: RuntimeKey | None = None
 _RUNTIME_CACHE_VALUE: InferenceRuntime | None = None
 
 
-def get_cached_runtime(key: RuntimeKey) -> tuple[InferenceRuntime, bool]:
+def get_cached_runtime(key: RuntimeKey, *, max_parallelism: int = 1) -> tuple[InferenceRuntime, bool]:
     global _RUNTIME_CACHE_KEY, _RUNTIME_CACHE_VALUE
     with _RUNTIME_CACHE_LOCK:
         if _RUNTIME_CACHE_VALUE is not None and _RUNTIME_CACHE_KEY == key:
-            return _RUNTIME_CACHE_VALUE, False
+            runtime = _RUNTIME_CACHE_VALUE
+            # キャッシュヒット時も max_parallelism が異なれば並列数を動的に反映
+            if max_parallelism > 1 and runtime.max_parallelism != max(1, int(max_parallelism)):
+                runtime.set_max_parallelism(int(max_parallelism))
+            return runtime, False
 
         old_runtime = _RUNTIME_CACHE_VALUE
-        runtime = InferenceRuntime.from_key(key)
+        runtime = InferenceRuntime.from_key(key, max_parallelism=max_parallelism)
         _RUNTIME_CACHE_KEY = key
         _RUNTIME_CACHE_VALUE = runtime
 

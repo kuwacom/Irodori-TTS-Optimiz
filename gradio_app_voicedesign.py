@@ -164,6 +164,7 @@ def _describe_runtime(
     model_precision: str,
     codec_device: str,
     codec_precision: str,
+    max_parallelism: int = 1,
 ) -> str:
     runtime_key = _build_runtime_key(
         checkpoint=checkpoint,
@@ -172,7 +173,7 @@ def _describe_runtime(
         codec_device=codec_device,
         codec_precision=codec_precision,
     )
-    runtime, reloaded = get_cached_runtime(runtime_key)
+    runtime, reloaded = get_cached_runtime(runtime_key, max_parallelism=int(max_parallelism))
     status = (
         "loaded model into memory" if reloaded else "model already loaded; reused existing runtime"
     )
@@ -193,6 +194,7 @@ def _describe_runtime(
             f"model_precision: {runtime_key.model_precision}",
             f"codec_device: {runtime_key.codec_device}",
             f"codec_precision: {runtime_key.codec_precision}",
+            f"max_parallelism: {runtime.max_parallelism}",
             f"use_caption_condition: {runtime.model_cfg.use_caption_condition}",
             f"use_speaker_condition: {runtime.model_cfg.use_speaker_condition_resolved}",
             *notes,
@@ -232,6 +234,7 @@ def _run_generation(
     rescale_k_raw: str,
     rescale_sigma_raw: str,
     lora_adapter_raw: str,
+    max_parallelism: int = 1,
 ) -> tuple[object, ...]:
     def stdout_log(msg: str) -> None:
         print(msg, flush=True)
@@ -267,7 +270,7 @@ def _run_generation(
     manual_seconds = _parse_optional_float(seconds_raw, "seconds")
     lora_adapter = _parse_optional_str(lora_adapter_raw)
 
-    runtime, reloaded = get_cached_runtime(runtime_key)
+    runtime, reloaded = get_cached_runtime(runtime_key, max_parallelism=int(max_parallelism))
     if not runtime.model_cfg.use_caption_condition:
         raise ValueError(
             "Loaded checkpoint does not enable caption conditioning. Use gradio_app.py for the original reference-audio model."
@@ -426,6 +429,14 @@ def build_ui() -> gr.Blocks:
                 label="Codec Precision",
                 choices=codec_precision_choices,
                 value=codec_precision_choices[0],
+                scale=1,
+            )
+            max_parallelism = gr.Slider(
+                label="Max Parallelism",
+                minimum=1,
+                maximum=8,
+                value=1,
+                step=1,
                 scale=1,
             )
 
@@ -593,6 +604,7 @@ def build_ui() -> gr.Blocks:
                 rescale_k_raw,
                 rescale_sigma_raw,
                 lora_adapter_raw,
+                max_parallelism,
             ],
             outputs=[*out_audios, out_log, out_timing],
         )
@@ -614,6 +626,7 @@ def build_ui() -> gr.Blocks:
                 model_precision,
                 codec_device,
                 codec_precision,
+                max_parallelism,
             ],
             outputs=[clear_cache_msg],
         )
@@ -633,7 +646,10 @@ def main() -> None:
     args = parser.parse_args()
 
     demo = build_ui()
-    demo.queue(default_concurrency_limit=1)
+    # 並列推論を有効にするため generate イベントの同時実行数を max_parallelism に合わせる
+    # ユーザーが UI から並列数を変更した場合は、この値より多くのスレッドが
+    # 同時に synthesize に入ることはない
+    demo.queue(max_size=20, default_concurrency_limit=8)
     demo.launch(
         server_name=args.server_name,
         server_port=args.server_port,

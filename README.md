@@ -111,9 +111,104 @@ uv sync --no-default-groups --extra legacy-cuda
 この extra は PyTorch / Torchaudio を `2.5.1` + `cu118` 系に固定します。
 `current-cuda` dependency group は通常環境用に default で有効なため、legacy CUDA 環境では `--no-default-groups` を付けて切り替えてください。
 
+### 並列推論 (Parallel Inference)
+
+1つのモデル重みを VRAM に載せたまま、複数リクエストを同時に推論可能にする機能です。
+各リクエストは steps / CFG scale / speaker / caption などを完全に独立してカスタムできます。
+API サーバーなどで `asyncio.to_thread` 等により複数スレッドから `runtime.synthesize()` を同時に呼び出すことを想定しています。
+
+#### アーキテクチャ
+
+```
+FastAPI / Gradio サーバー
+  └─ InferenceRuntime (1つだけロード)
+      ├─ ワーカープール (Semaphore で並列実行数制限)
+      │   ├─ Worker 0: CUDA Stream 0 → model (共有重み)
+      │   ├─ Worker 1: CUDA Stream 1 → model (同じ重み)
+      │   └─ Worker N: CUDA Stream N → model (同じ重み)
+      ├─ _lora_lock (LoRA アダプタ切り替え時のみ排他)
+      └─ _InferenceScope (セマフォ/Stream/LoRA context の一括ライフタイム管理)
+```
+
+- モデル重みは1つだけ VRAM にロードし、全ワーカーで共有する
+- 各ワーカーには専用の CUDA Stream が割り当てられ、GPU カーネルレベルで並列オーバーラップする
+- LoRA アダプタの切り替えは排他制御下で行うが、推論本体は並列に実行される
+- 動的バッチングは行わない（リクエストごとにパラメータが異なるため非現実的）
+
+#### RoPE キャッシュの事前確保
+
+並列推論では `_freqs_cis_cache` の上書き競合が問題になります。
+これを防ぐため、`InferenceRuntime` の初期化時に `prewarm_rope_cache()` を呼び出し、
+全エンコーダ (text / caption / speaker) の RoPE キャッシュを最大長で事前確保しています。
+
+#### 使い方
+
+初期化時に `max_parallelism` を指定:
+
+```python
+from irodori_tts import InferenceRuntime, RuntimeKey
+
+key = RuntimeKey(
+    checkpoint="path/to/model.safetensors",
+    model_device="cuda",
+    model_precision="bf16",
+)
+
+# 初期化時に並列数を指定
+runtime = InferenceRuntime.from_key(key, max_parallelism=3)
+```
+
+キャッシュ経由でも指定可能:
+
+```python
+from irodori_tts import get_cached_runtime
+
+runtime, loaded = get_cached_runtime(key, max_parallelism=3)
+```
+
+実行時に動的に変更することも可能:
+
+```python
+# キャッシュヒット時や、サーバー稼働中に並列数を変更する場合
+runtime.set_max_parallelism(4)
+```
+
+`set_max_parallelism()` はセマフォと CUDA Stream プールを再構築します。
+実行中のリクエストがある場合、それらの完了後に新しい並列数が反映されます。
+
+#### Gradio Web UI
+
+Gradio UI の Load Model 横に **Max Parallelism** スライダー (1〜8) を追加しています。
+モデルロード時に設定するほか、Generate ボタン押下時にも値が反映されます。
+
+#### API サーバーからの利用
+
+```python
+import asyncio
+from irodori_tts import InferenceRuntime, RuntimeKey, SamplingRequest
+
+# 初期化 (1回だけ)
+runtime = InferenceRuntime.from_key(key, max_parallelism=3)
+
+# 複数リクエストを同時に処理
+async def handle_request(text: str):
+    req = SamplingRequest(text=text, no_ref=True, ...)
+    # イベントループをブロックしないよう別スレッドで実行
+    return await asyncio.to_thread(runtime.synthesize, req)
+```
+
+`runtime.synthesize()` はスレッドセーフです。
+内部でセマフォによる並列実行数制限と CUDA Stream 分離が行われるため、
+呼び出し側でロックを取得する必要はありません。
+
+#### 注意点
+
+- 並列実行数は VRAM に依存します。500M モデルなので 24GB GPU で 3〜4 並列が目安です。
+- 並列数を増やすと個別リクエストの所要時間は延びるが、スループット（単位時間あたりの処理リクエスト数）は向上します
+- `_SKIP_TIMING_SYNC`: 並列数 2 以上の場合、タイミング計測の `torch.cuda.synchronize()` をスキップしてスループットを向上させる（`total_to_decode` の計測精度は下がる）
+
 ### 今後の検討項目
 
-- REST API 化
 - 生成結果 / reference latent 管理の改善
 - condition K/V cache の text / speaker / caption 分離
 - CFG cache の lazy build
