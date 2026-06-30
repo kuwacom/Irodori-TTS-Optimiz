@@ -519,7 +519,7 @@ def build_ui() -> gr.Blocks:
                 )
 
         with gr.Accordion("Advanced (Optional)", open=False):
-            cfg_scale_raw = gr.Textbox(label="CFG Scale Override (optional)", value="")
+            cfg_scale_raw = gr.Textbox(label="CFG Scale Override (optional, set e.g. 3.0 for joint mode)", value="")
             with gr.Row():
                 cfg_min_t = gr.Number(label="CFG Min t", value=0.5)
                 cfg_max_t = gr.Number(label="CFG Max t", value=1.0)

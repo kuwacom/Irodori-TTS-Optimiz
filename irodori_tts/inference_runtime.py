@@ -316,11 +316,20 @@ def resolve_cfg_scales(
     enabled_vals = [value for value in (text_val, speaker_val) if value > 0.0]
     if use_caption_condition and caption_val > 0.0:
         enabled_vals.append(caption_val)
+    # joint モードでは有効なCFGスケールを均一にする必要がある
+    # cfg_scale が未指定でスケール値が異なる場合、有効値の平均で均一化する
     if mode == "joint" and enabled_vals and (max(enabled_vals) - min(enabled_vals) > 1e-6):
-        raise ValueError(
-            "cfg_guidance_mode='joint' requires equal enabled cfg_scale_text/cfg_scale_caption/cfg_scale_speaker, "
-            "or set cfg_scale."
+        avg_val = sum(enabled_vals) / len(enabled_vals)
+        messages.append(
+            f"info: cfg_guidance_mode='joint' requires equal scales; "
+            f"averaging enabled values ({enabled_vals}) -> {avg_val:.4f}."
         )
+        if text_val > 0.0:
+            text_val = avg_val
+        if use_caption_condition and caption_val > 0.0:
+            caption_val = avg_val
+        if speaker_val > 0.0:
+            speaker_val = avg_val
 
     return text_val, caption_val, speaker_val, messages
 
