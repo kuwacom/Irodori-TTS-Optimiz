@@ -173,8 +173,7 @@ def _describe_runtime(
         codec_device=codec_device,
         codec_precision=codec_precision,
     )
-    runtime, reloaded = get_cached_runtime(runtime_key)
-    runtime.set_max_parallelism(int(max_parallelism))
+    runtime, reloaded = get_cached_runtime(runtime_key, max_parallelism=int(max_parallelism))
     status = (
         "loaded model into memory" if reloaded else "model already loaded; reused existing runtime"
     )
@@ -271,8 +270,7 @@ def _run_generation(
     manual_seconds = _parse_optional_float(seconds_raw, "seconds")
     lora_adapter = _parse_optional_str(lora_adapter_raw)
 
-    runtime, reloaded = get_cached_runtime(runtime_key)
-    runtime.set_max_parallelism(int(max_parallelism))
+    runtime, reloaded = get_cached_runtime(runtime_key, max_parallelism=int(max_parallelism))
     if not runtime.model_cfg.use_caption_condition:
         raise ValueError(
             "Loaded checkpoint does not enable caption conditioning. Use gradio_app.py for the original reference-audio model."

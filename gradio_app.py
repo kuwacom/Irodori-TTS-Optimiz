@@ -196,8 +196,7 @@ def _load_model(
         codec_device=codec_device,
         codec_precision=codec_precision,
     )
-    runtime, reloaded = get_cached_runtime(runtime_key)
-    runtime.set_max_parallelism(int(max_parallelism))
+    runtime, reloaded = get_cached_runtime(runtime_key, max_parallelism=int(max_parallelism))
     if reloaded:
         status = "loaded model into memory"
     else:
@@ -288,8 +287,7 @@ def _run_generation(
     ref_normalize_db = -16.0
     ref_ensure_max = True
 
-    runtime, reloaded = get_cached_runtime(runtime_key)
-    runtime.set_max_parallelism(int(max_parallelism))
+    runtime, reloaded = get_cached_runtime(runtime_key, max_parallelism=int(max_parallelism))
     stdout_log(f"[gradio] runtime: {'reloaded' if reloaded else 'reused'}")
     stdout_log(
         (
