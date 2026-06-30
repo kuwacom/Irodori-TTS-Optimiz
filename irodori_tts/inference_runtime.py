@@ -171,6 +171,7 @@ class RuntimeKey:
     codec_precision: str = "fp32"
     codec_deterministic_encode: bool = True
     codec_deterministic_decode: bool = True
+    enable_watermark: bool = False
     compile_model: bool = False
     compile_dynamic: bool = False
 
@@ -527,7 +528,10 @@ class InferenceRuntime:
         self.codec = codec
         self.default_text_max_len = default_text_max_len
         self.default_caption_max_len = default_caption_max_len
-        self.watermarker = SilentCipherWatermarker(device=str(self.codec_device))
+        self.watermarker: SilentCipherWatermarker | None = (
+            SilentCipherWatermarker(device=str(self.codec_device))
+            if bool(key.enable_watermark) else None
+        )
         # 並列推論 (Parallel) 設定
         max_par = max(1, int(max_parallelism))
         self._max_parallelism: int = max_par
@@ -1206,7 +1210,7 @@ class InferenceRuntime:
                 self.key.model_precision,
                 self.key.codec_device,
                 self.key.codec_precision,
-                self.watermarker.ready,
+                self.key.enable_watermark and (self.watermarker is not None and self.watermarker.ready),
                 req.cfg_guidance_mode,
                 req.seconds,
                 req.num_steps,
@@ -1642,7 +1646,7 @@ class InferenceRuntime:
             stage_timings.append(("decode_latent", stage_sec))
             _log(f"[runtime] decode_latent ({decode_mode}): {stage_sec * 1000.0:.1f} ms")
 
-            if self.watermarker.ready:
+            if self.watermarker is not None and self.watermarker.ready:
                 t0 = _measure_start(self.codec_device, skip_timing_sync=self._skip_timing_sync)
                 trimmed_audios = self.watermarker.encode_batch(
                     trimmed_audios,
@@ -1651,9 +1655,13 @@ class InferenceRuntime:
                 stage_sec = _measure_end(self.codec_device, t0, skip_timing_sync=self._skip_timing_sync)
                 stage_timings.append(("silentcipher_watermark", stage_sec))
                 _log(f"[runtime] silentcipher_watermark: {stage_sec * 1000.0:.1f} ms")
+            elif self.watermarker is None:
+                # watermark が明示的に無効化されている場合は info として記録
+                pass
             else:
+                # watermarker は作成済みだが SilentCipher モデルがロードできなかった
                 msg = (
-                    "warning: SilentCipher watermark is unavailable; generated audio was not "
+                    "warning: SilentCipher watermark model is unavailable; generated audio was not "
                     "watermarked."
                 )
                 messages.append(msg)

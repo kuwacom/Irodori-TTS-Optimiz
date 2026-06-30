@@ -144,6 +144,7 @@ def _build_runtime_key(
     model_precision: str,
     codec_device: str,
     codec_precision: str,
+    enable_watermark: bool = False,
 ) -> RuntimeKey:
     checkpoint_path = _resolve_checkpoint_path(checkpoint)
     return RuntimeKey(
@@ -155,6 +156,7 @@ def _build_runtime_key(
         codec_precision=str(codec_precision),
         compile_model=False,
         compile_dynamic=False,
+        enable_watermark=bool(enable_watermark),
     )
 
 
@@ -165,6 +167,7 @@ def _describe_runtime(
     codec_device: str,
     codec_precision: str,
     max_parallelism: int = 1,
+    enable_watermark: bool = False,
 ) -> str:
     runtime_key = _build_runtime_key(
         checkpoint=checkpoint,
@@ -172,6 +175,7 @@ def _describe_runtime(
         model_precision=model_precision,
         codec_device=codec_device,
         codec_precision=codec_precision,
+        enable_watermark=bool(enable_watermark),
     )
     runtime, reloaded = get_cached_runtime(runtime_key, max_parallelism=int(max_parallelism))
     status = (
@@ -235,6 +239,7 @@ def _run_generation(
     rescale_sigma_raw: str,
     lora_adapter_raw: str,
     max_parallelism: int = 1,
+    enable_watermark: bool = False,
 ) -> tuple[object, ...]:
     def stdout_log(msg: str) -> None:
         print(msg, flush=True)
@@ -245,6 +250,7 @@ def _run_generation(
         model_precision=model_precision,
         codec_device=codec_device,
         codec_precision=codec_precision,
+        enable_watermark=bool(enable_watermark),
     )
 
     text_value = "" if text is None else str(text).strip()
@@ -439,6 +445,7 @@ def build_ui() -> gr.Blocks:
                 step=1,
                 scale=1,
             )
+            enable_watermark = gr.Checkbox(label="Enable Watermark", value=False)
 
         with gr.Row():
             load_model_btn = gr.Button("Load Model")
@@ -605,6 +612,7 @@ def build_ui() -> gr.Blocks:
                 rescale_sigma_raw,
                 lora_adapter_raw,
                 max_parallelism,
+                enable_watermark,
             ],
             outputs=[*out_audios, out_log, out_timing],
         )
@@ -627,6 +635,7 @@ def build_ui() -> gr.Blocks:
                 codec_device,
                 codec_precision,
                 max_parallelism,
+                enable_watermark,
             ],
             outputs=[clear_cache_msg],
         )
