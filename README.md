@@ -207,6 +207,73 @@ async def handle_request(text: str):
 - 並列数を増やすと個別リクエストの所要時間は延びるが、スループット（単位時間あたりの処理リクエスト数）は向上します
 - `_SKIP_TIMING_SYNC`: 並列数 2 以上の場合、タイミング計測の `torch.cuda.synchronize()` をスキップしてスループットを向上させる（`total_to_decode` の計測精度は下がる）
 
+### 長文分割読み上げ (Long Text Synthesis)
+
+diffusion の最大生成時間（30秒）を超える長文を、句読点・絵文字などの自然な区切りで分割し、
+バッチ推論して結合する機能です。`synthesize_long()` として通常推論とは独立に実装しています。
+
+#### 処理フロー
+
+1. **テキスト分割** (`split_long_text`): 句読点・絵文字ベースで自然に分割。
+   `duration_scale` を考慮し、実効上限秒数 (`max_segment_seconds / duration_scale`) に収まる文字数を逆算
+2. **共通前処理**: speaker参照・caption・CFG等をバッチ/逐次ループの外で1回だけ計算（効率化とバグ防止）
+3. **バッチ推論**: セグメントを `max_batch_segments` 件ずつチャンクに分け、各チャンクを1回の diffusion sampling で一括生成
+4. **音声結合**: 各セグメントの前後無音をトリムし、`segment_gap_seconds` 分の無音を挿入して結合
+
+#### 主なパラメータ
+
+| パラメータ | デフォルト | 説明 |
+|---|---|---|
+| `--max-segment-seconds` | `28.0` | 1セグメントの最大推定秒数 |
+| `--max-segment-chars` | `200` | 1セグメントの最大文字数 |
+| `--segment-gap` | `0.15` | セグメント間の無音秒数（前後無音トリム後） |
+| `--segment-trim-silence-db` | `-40.0` | 前後無音トリムのしきい値 (dB) |
+| `--max-batch-segments` | `8` | 1バッチで同時に処理するセグメント最大数 |
+| `--duration-scale` | `1.0` | 話速スケール（分割時の上限秒数にも反映） |
+
+`max_batch_segments=1` にすると、従来の逐次処理と同等になります。
+
+#### CLI
+
+```bash
+uv run python infer.py \
+  --hf-checkpoint Aratako/Irodori-TTS-500M-v3 \
+  --text "長いテキストを指定します。句読点で自然に分割され、バッチ推論されて結合されます。" \
+  --ref-wav path/to/reference.wav \
+  --long-text \
+  --max-segment-seconds 28 \
+  --max-batch-segments 4 \
+  --segment-gap 0.15 \
+  --output-wav outputs/long_sample.wav
+```
+
+#### Gradio Web UI
+
+`gradio_app.py` / `gradio_app_voicedesign.py` に "Long Text Synthesis" タブを追加しています。
+通常推論タブと並存し、分割プレビュー・gap秒数・trimしきい値・batch数などをUIから調整できます。
+
+#### API
+
+```python
+from irodori_tts import InferenceRuntime, RuntimeKey, LongTextSamplingRequest
+
+runtime = InferenceRuntime.from_key(key)
+result = runtime.synthesize_long(
+    LongTextSamplingRequest(
+        text="長いテキスト...",
+        ref_wav="path/to/reference.wav",
+        max_segment_seconds=28.0,
+        max_batch_segments=8,
+        segment_gap_seconds=0.15,
+        segment_trim_silence_db=-40.0,
+        duration_scale=1.0,
+        num_steps=40,
+    ),
+)
+# result.audio: 結合された全体音声
+# result.segment_audios: セグメントごとの音声リスト
+```
+
 ### 今後の検討項目
 
 - 生成結果 / reference latent 管理の改善
@@ -363,6 +430,20 @@ uv run python infer.py \
   --output-wav outputs/sample_speaker_inversion.wav
 ```
 
+### Long Text Synthesis
+
+For text that exceeds the diffusion maximum generation time (30 seconds), enable `--long-text` to split
+the input at natural punctuation boundaries, generate each segment, and concatenate the results:
+
+```bash
+uv run python infer.py \
+  --hf-checkpoint Aratako/Irodori-TTS-500M-v3 \
+  --text "長いテキストを指定します。句読点で自然に分割され、バッチ推論されて結合されます。" \
+  --ref-wav path/to/reference.wav \
+  --long-text \
+  --output-wav outputs/long_sample.wav
+```
+
 ### Gradio Web UI
 
 ```bash
@@ -390,6 +471,8 @@ uv run --no-default-groups --extra legacy-cuda python gradio_app_voicedesign.py 
 The hosted VoiceDesign demo is available at [Aratako/Irodori-TTS-600M-v3-VoiceDesign-Demo](https://huggingface.co/spaces/Aratako/Irodori-TTS-600M-v3-VoiceDesign-Demo).
 
 `gradio_app.py` is for `Aratako/Irodori-TTS-500M-v3`. `gradio_app_voicedesign.py` is for `Aratako/Irodori-TTS-600M-v3-VoiceDesign` and remains compatible with v2 VoiceDesign checkpoints.
+
+Both UIs include a **Long Text Synthesis** tab alongside the normal synthesis tab, allowing you to try split-and-concatenate generation interactively.
 
 ## Inference
 
@@ -776,6 +859,7 @@ Irodori-TTS/
 │   ├── tokenizer.py            # Pretrained LLM tokenizer wrapper
 │   ├── config.py               # Model / Train / Sampling config dataclasses
 │   ├── inference_runtime.py    # Cached, thread-safe inference runtime
+│   ├── long_text_splitter.py  # Long text segmentation for synthesis
 │   ├── lora.py                 # PEFT LoRA integration helpers
 │   ├── speaker_inversion.py    # Speaker Inversion embedding save/load helpers
 │   ├── text_normalization.py   # Japanese text normalization

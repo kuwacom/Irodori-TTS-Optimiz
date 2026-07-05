@@ -190,6 +190,43 @@ appropriate output length.
 If valid audio is being trimmed too aggressively, disable `--trim-tail` first.
 Adjust the tail thresholds only when you need fine control over the trimming heuristic.
 
+### Long Text Splitting
+
+These parameters control the `--long-text` mode, which splits long input text into
+segments that fit within the diffusion maximum generation time, generates each segment
+in batches, and concatenates the results.
+
+| Parameter | Default | Notes |
+|-----------|---------|-------|
+| `--long-text` | `False` | Enables long text splitting mode. When set, `--seconds`, `--duration-scale` (for duration prediction), and `--num-candidates` behave as per-segment settings. |
+| `--max-segment-seconds` | `28.0` | Maximum estimated seconds per segment. The splitter keeps each segment within this bound (after `--duration-scale` adjustment). |
+| `--max-segment-chars` | `200` | Maximum characters per segment. Segments exceeding this are force-split at character boundaries. |
+| `--chars-per-second` | `10.0` | Estimated characters per second for duration estimation. Used only for splitting heuristics; actual duration is predicted by the model. |
+| `--min-segment-chars` | `4` | Minimum characters per segment. Shorter fragments are merged into the previous segment. |
+| `--segment-gap` | `0.15` | Silence duration in seconds inserted between segments after trimming edge silence. |
+| `--segment-trim-silence-db` | `-40.0` | Threshold in dB for trimming leading/trailing silence from each segment waveform. `-40` corresponds to approximately 1% amplitude. |
+| `--max-batch-segments` | `8` | Maximum number of segments processed in a single batch diffusion pass. Segments exceeding this are processed in sequential batches. Set to `1` for pure sequential processing. |
+
+#### How splitting works
+
+1. The text is scanned for natural boundaries: strong punctuation (`。？！.` etc.),
+   weak punctuation (`、，` etc.), and allowed emoji annotations.
+2. `--duration-scale` is factored into the effective limit:
+   `effective_max_seconds = max_segment_seconds / duration_scale`. A scale above `1.0`
+   (slower speech) reduces the text capacity per segment and produces more segments.
+3. Adjacent fragments are merged if their combined estimate stays within the effective limit.
+4. Segments still exceeding `--max-segment-chars` after merging are force-split at character boundaries.
+5. Common preprocessing (reference audio encoding, speaker/caption encoding, CFG resolution)
+   runs once before the batch loop. Each batch reuses the precomputed conditions.
+6. After generation, each segment's leading and trailing silence is trimmed at
+   `--segment-trim-silence-db`, then `--segment-gap` seconds of silence is inserted
+   between segments before concatenation.
+
+`--max-batch-segments` controls the trade-off between speed and VRAM. A higher value
+processes more segments in a single diffusion pass (faster) but uses more VRAM. When
+the number of segments exceeds `--max-batch-segments`, the excess segments are processed
+in subsequent sequential batches, reusing the same precomputed conditions.
+
 ## Training Parameters
 
 Training is configured through YAML files with `model` and `train` sections. CLI options
