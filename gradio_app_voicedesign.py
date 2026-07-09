@@ -428,11 +428,11 @@ def _run_long_generation(
     lora_adapter_raw: str,
     max_parallelism: int = 1,
     enable_watermark: bool = False,
-    max_segment_seconds: float = 28.0,
-    max_segment_chars: int = 200,
+    max_segment_seconds: float = 30.0,
+    max_segment_chars: int = 180,
     chars_per_second: float = 10.0,
     min_segment_chars: int = 4,
-    segment_gap_seconds: float = 0.15,
+    segment_gap_seconds: float = 0.2,
     segment_trim_silence_db: float = -40.0,
     max_batch_segments: int = 8,
     duration_scale: float = 1.0,
@@ -922,14 +922,14 @@ def build_ui() -> gr.Blocks:
                             label="Max Segment Seconds",
                             minimum=5.0,
                             maximum=30.0,
-                            value=28.0,
+                            value=30.0,
                             step=0.5,
                         )
                         long_max_segment_chars = gr.Slider(
                             label="Max Segment Chars",
                             minimum=50,
                             maximum=500,
-                            value=200,
+                            value=180,
                             step=10,
                         )
                         long_chars_per_second = gr.Slider(
@@ -951,7 +951,7 @@ def build_ui() -> gr.Blocks:
                             label="Segment Gap (seconds)",
                             minimum=0.0,
                             maximum=2.0,
-                            value=0.15,
+                            value=0.2,
                             step=0.05,
                         )
                         long_segment_trim_silence_db = gr.Slider(

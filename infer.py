@@ -403,14 +403,14 @@ def main() -> None:
     long_text_group.add_argument(
         "--max-segment-seconds",
         type=float,
-        default=28.0,
-        help="Maximum estimated duration per segment in seconds (default: 28).",
+        default=30.0,
+        help="Maximum estimated duration per segment in seconds (default: 30).",
     )
     long_text_group.add_argument(
         "--max-segment-chars",
         type=int,
-        default=200,
-        help="Maximum character count per segment before forced cut (default: 200).",
+        default=180,
+        help="Maximum character count per segment before forced cut (default: 180).",
     )
     long_text_group.add_argument(
         "--chars-per-second",
@@ -427,8 +427,8 @@ def main() -> None:
     long_text_group.add_argument(
         "--segment-gap",
         type=float,
-        default=0.15,
-        help="Gap duration in seconds between concatenated segments after trimming edge silence (default: 0.15).",
+        default=0.2,
+        help="Gap duration in seconds between concatenated segments after trimming edge silence (default: 0.2). ゆったりめのキャラクターでは 0.4 程度に広げると自然。",
     )
     long_text_group.add_argument(
         "--segment-trim-silence-db",

@@ -2539,8 +2539,8 @@ class LongTextSamplingRequest:
     tail_mean_threshold: float = 0.1
     lora_adapter: str | None = None
     # 長文分割固有パラメータ
-    max_segment_seconds: float = 28.0
-    max_segment_chars: int = 200
+    max_segment_seconds: float = 30.0
+    max_segment_chars: int = 180
     chars_per_second: float = 10.0
     min_segment_chars: int = 4
     # セグメントごとの話速スケール (>1 遅く, <1 速く)
@@ -2549,7 +2549,7 @@ class LongTextSamplingRequest:
     segment_trim_silence_db: float = -40.0
     # セグメント間の無音区間 (秒)
     # 前後無音をトリムしたセグメント同士の間に挟む無音の長さ
-    segment_gap_seconds: float = 0.15
+    segment_gap_seconds: float = 0.2
     # 1回のバッチで同時に処理するセグメント最大数
     max_batch_segments: int = 8
 

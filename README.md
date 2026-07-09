@@ -222,16 +222,32 @@ diffusion の最大生成時間（30秒）を超える長文を、句読点・�
 
 #### 主なパラメータ
 
-| パラメータ | デフォルト | 説明 |
-|---|---|---|
-| `--max-segment-seconds` | `28.0` | 1セグメントの最大推定秒数 |
-| `--max-segment-chars` | `200` | 1セグメントの最大文字数 |
-| `--segment-gap` | `0.15` | セグメント間の無音秒数（前後無音トリム後） |
-| `--segment-trim-silence-db` | `-40.0` | 前後無音トリムのしきい値 (dB) |
-| `--max-batch-segments` | `8` | 1バッチで同時に処理するセグメント最大数 |
-| `--duration-scale` | `1.0` | 話速スケール（分割時の上限秒数にも反映） |
+| パラメータ                  | デフォルト | 説明                                                                                              |
+| --------------------------- | ---------- | ------------------------------------------------------------------------------------------------- |
+| `--max-segment-seconds`     | `30.0`     | 1セグメントの最大推定秒数                                                                         |
+| `--max-segment-chars`       | `180`      | 1セグメントの最大文字数                                                                           |
+| `--segment-gap`             | `0.2`      | セグメント間の無音秒数（前後無音トリム後）。ゆったりめのキャラクターでは `0.4` 程度に広げると自然 |
+| `--segment-trim-silence-db` | `-40.0`    | 前後無音トリムのしきい値 (dB)                                                                     |
+| `--max-batch-segments`      | `8`        | 1バッチで同時に処理するセグメント最大数                                                           |
+| `--duration-scale`          | `1.0`      | 話速スケール（分割時の上限秒数にも反映）                                                          |
 
 `max_batch_segments=1` にすると、従来の逐次処理と同等になります。
+
+##### 推奨プリセット目安 (`duration_scale = 1.0` 前提)
+
+`max_segment_seconds / max_segment_chars / segment_gap_seconds` の組み合わせは、
+読み上げの「詰め込み具合」と「自然さ」のトレードオフになります。
+以下は目安となる3つの代表例です:
+
+| 設定                   | 秒数 / 文字 / gap | 特徴                                                                 |
+| ---------------------- | ----------------- | -------------------------------------------------------------------- |
+| **自然** (デフォルト)  | `30 / 180 / 0.2`  | 各セグメントを個別で作ってつなげるのに等しい、無理なく自然な読み上げ |
+| **早め・詰め込み気味** | `30 / 200 / 0.2`  | 少々早めのテンポで、1セグメントに多く詰め込む読み上げスタイル        |
+| **時間不足感あり**     | `28 / 200 / 0.2`  | セクション時間が足りていない感があり、長文では分割回数が増える       |
+
+> **gap の調整**: `segment_gap_seconds` はキャラクターの話速テンポに合わせて調整してください。
+> デフォルトの `0.2s` は標準的なテンポ向けです。
+> ゆったりめのキャラクター(ゆっくり話す・間を多く取る話し方) の場合は `0.4s` 程度に広げると、セグメント間の休止が自然になり、全体として落ち着いた読み上げになります。
 
 #### CLI
 
@@ -241,9 +257,9 @@ uv run python infer.py \
   --text "長いテキストを指定します。句読点で自然に分割され、バッチ推論されて結合されます。" \
   --ref-wav path/to/reference.wav \
   --long-text \
-  --max-segment-seconds 28 \
+  --max-segment-seconds 30 \
   --max-batch-segments 4 \
-  --segment-gap 0.15 \
+  --segment-gap 0.2 \
   --output-wav outputs/long_sample.wav
 ```
 
@@ -262,9 +278,9 @@ result = runtime.synthesize_long(
     LongTextSamplingRequest(
         text="長いテキスト...",
         ref_wav="path/to/reference.wav",
-        max_segment_seconds=28.0,
+        max_segment_seconds=30.0,
         max_batch_segments=8,
-        segment_gap_seconds=0.15,
+        segment_gap_seconds=0.2,
         segment_trim_silence_db=-40.0,
         duration_scale=1.0,
         num_steps=40,

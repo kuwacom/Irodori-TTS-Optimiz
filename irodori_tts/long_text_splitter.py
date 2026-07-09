@@ -116,7 +116,7 @@ def split_long_text(
     text: str,
     *,
     max_seconds: float = 30.0,
-    max_chars: int = 200,
+    max_chars: int = 180,
     chars_per_second: float = 10.0,
     min_segment_chars: int = 4,
     duration_scale: float = 1.0,
