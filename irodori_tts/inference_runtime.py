@@ -7,7 +7,6 @@ import math
 import secrets
 import threading
 import time
-from collections import OrderedDict
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -20,10 +19,15 @@ from safetensors import safe_open
 from safetensors.torch import load_file as load_safetensors_file
 
 from .codec import DACVAECodec, patchify_latent, unpatchify_latent
-from .config import ModelConfig
+from .config import ModelConfig, merge_dataclass_overrides
 from .duration import build_duration_features
 from .lora import checkpoint_state_uses_lora, is_lora_adapter_dir, load_lora_adapter
-from .model import TextToLatentRFDiT, patch_sequence_with_mask
+from .model import TextToLatentRFDiT
+from .quantization import (
+    is_torchao_quantized_state_dict,
+    parse_quantization_metadata,
+    unflatten_quantized_state_dict,
+)
 from .rf import sample_euler_rf_cfg
 from .speaker_inversion import (
     load_speaker_inversion_payload,
@@ -32,7 +36,6 @@ from .speaker_inversion import (
 from .text_normalization import normalize_text
 from .tokenizer import PretrainedTextTokenizer
 from .watermark import SilentCipherWatermarker
-from .long_text_splitter import LongTextSplitResult, SplitSegment, split_long_text
 
 
 def _is_mps_available() -> bool:
@@ -40,6 +43,13 @@ def _is_mps_available() -> bool:
     if backends is None or not hasattr(backends, "mps"):
         return False
     return bool(torch.backends.mps.is_available())
+
+
+def _is_xpu_available() -> bool:
+    try:
+        return bool(torch.xpu.is_available())
+    except AttributeError:
+        return False
 
 
 def resolve_runtime_device(device: str | torch.device) -> torch.device:
@@ -56,7 +66,15 @@ def resolve_runtime_device(device: str | torch.device) -> torch.device:
         if not _is_mps_available():
             raise ValueError("MPS device requested but torch.backends.mps.is_available() is False.")
         return torch.device("mps")
-    raise ValueError(f"Unsupported inference device={resolved!s}. Expected one of: cpu, cuda, mps.")
+    if resolved.type == "xpu":
+        if resolved.index is not None:
+            raise ValueError("XPU device index is not supported. Use 'xpu'.")
+        if not _is_xpu_available():
+            raise ValueError("XPU device requested but torch.xpu.is_available() is False.")
+        return torch.device("xpu")
+    raise ValueError(
+        f"Unsupported inference device={resolved!s}. Expected one of: cpu, cuda, mps, xpu."
+    )
 
 
 def list_available_runtime_devices() -> list[str]:
@@ -65,6 +83,8 @@ def list_available_runtime_devices() -> list[str]:
         devices.append("cuda")
     if _is_mps_available():
         devices.append("mps")
+    if _is_xpu_available():
+        devices.append("xpu")
     devices.append("cpu")
     return devices
 
@@ -75,40 +95,41 @@ def default_runtime_device() -> str:
 
 def list_available_runtime_precisions(device: str | torch.device) -> list[str]:
     resolved = resolve_runtime_device(device)
-    if resolved.type == "cuda":
+    if resolved.type in ("cuda", "xpu"):
         return ["fp32", "bf16"]
     return ["fp32"]
 
 
-
-def _sync_device(device: torch.device, *, skip_timing_sync: bool = False) -> None:
-    if skip_timing_sync:
-        return
+def _sync_device(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     elif device.type == "mps":
         mps = getattr(torch, "mps", None)
         if mps is not None and hasattr(mps, "synchronize"):
             mps.synchronize()
+    elif device.type == "xpu":
+        xpu = getattr(torch, "xpu", None)
+        if xpu is not None and hasattr(xpu, "synchronize"):
+            xpu.synchronize()
 
 
-def _sync_devices(*devices: torch.device, skip_timing_sync: bool = False) -> None:
+def _sync_devices(*devices: torch.device) -> None:
     seen: set[tuple[str, int | None]] = set()
     for device in devices:
         key = (device.type, device.index)
         if key in seen:
             continue
-        _sync_device(device, skip_timing_sync=skip_timing_sync)
+        _sync_device(device)
         seen.add(key)
 
 
-def _measure_start(device: torch.device, *extra_devices: torch.device, skip_timing_sync: bool = False) -> float:
-    _sync_devices(device, *extra_devices, skip_timing_sync=skip_timing_sync)
+def _measure_start(device: torch.device, *extra_devices: torch.device) -> float:
+    _sync_devices(device, *extra_devices)
     return time.perf_counter()
 
 
-def _measure_end(device: torch.device, t0: float, *extra_devices: torch.device, skip_timing_sync: bool = False) -> float:
-    _sync_devices(device, *extra_devices, skip_timing_sync=skip_timing_sync)
+def _measure_end(device: torch.device, t0: float, *extra_devices: torch.device) -> float:
+    _sync_devices(device, *extra_devices)
     return time.perf_counter() - t0
 
 
@@ -162,70 +183,6 @@ def find_flattening_point(
     return total_steps
 
 
-
-
-def trim_leading_silence(
-    audio: torch.Tensor,
-    threshold_db: float = -40.0,
-    min_silence_samples: int = 128,
-) -> torch.Tensor:
-    """音声波形の前方無音をトリムする
-
-    音声の振幅が threshold_db を超える最初のサンプル位置を検出し、
-    それより前の無音区間を除去する。
-    先頭無音が min_silence_samples 未満の場合はトリムしない
-
-    @param audio - (1, N) or (N,) 波形テンソル
-    @param threshold_db - 無音判定のしきい値 (dB)。-40dB ≈ 振幅1%
-    @param min_silence_samples - トリムすべき最小無音サンプル数
-    @returns トリム後の波形
-    """
-    if audio.ndim == 1:
-        audio = audio.unsqueeze(0)
-    if audio.ndim != 2 or audio.shape[0] != 1:
-        return audio
-    amplitude_threshold = 10.0 ** (threshold_db / 20.0)
-    abs_audio = audio.abs().squeeze(0)
-    above = torch.nonzero(abs_audio > amplitude_threshold)
-    if above.numel() == 0:
-        return audio
-    first_sound = int(above[0].item())
-    if first_sound < min_silence_samples:
-        return audio
-    return audio[:, first_sound:]
-
-
-def trim_trailing_silence(
-    audio: torch.Tensor,
-    threshold_db: float = -40.0,
-    min_silence_samples: int = 128,
-) -> torch.Tensor:
-    """音声波形の後方無音をトリムする
-
-    音声の振幅が threshold_db を下回る最後のサンプル位置を検出し、
-    それより後の無音区間を除去する。
-    末尾無音が min_silence_samples 未満の場合はトリムしない
-
-    @param audio - (1, N) or (N,) 波形テンソル
-    @param threshold_db - 無音判定のしきい値 (dB)
-    @param min_silence_samples - トリムすべき最小無音サンプル数
-    @returns トリム後の波形
-    """
-    if audio.ndim == 1:
-        audio = audio.unsqueeze(0)
-    if audio.ndim != 2 or audio.shape[0] != 1:
-        return audio
-    amplitude_threshold = 10.0 ** (threshold_db / 20.0)
-    abs_audio = audio.abs().squeeze(0)
-    above = torch.nonzero(abs_audio > amplitude_threshold)
-    if above.numel() == 0:
-        return audio
-    last_sound = int(above[-1].item()) + 1
-    trailing_silence = audio.shape[1] - last_sound
-    if trailing_silence < min_silence_samples:
-        return audio
-    return audio[:, :last_sound]
-
 @dataclass(frozen=True)
 class RuntimeKey:
     checkpoint: str
@@ -236,7 +193,6 @@ class RuntimeKey:
     codec_precision: str = "fp32"
     codec_deterministic_encode: bool = True
     codec_deterministic_decode: bool = True
-    enable_watermark: bool = False
     compile_model: bool = False
     compile_dynamic: bool = False
 
@@ -246,7 +202,9 @@ class SamplingRequest:
     text: str
     caption: str | None = None
     ref_wav: str | None = None
+    ref_wavs: list[str] | None = None
     ref_latent: str | None = None
+    ref_latents: list[str] | None = None
     ref_embed: str | None = None
     no_ref: bool = False
     ref_normalize_db: float | None = -16.0
@@ -257,10 +215,11 @@ class SamplingRequest:
     duration_scale: float = 1.0
     min_seconds: float = 0.5
     max_seconds: float = 30.0
-    max_ref_seconds: float | None = 30.0
+    # None selects the checkpoint recommendation; legacy checkpoints fall back
+    # to 30 seconds. A non-positive explicit value disables the cap.
+    max_ref_seconds: float | None = None
     max_text_len: int | None = None
     max_caption_len: int | None = None
-    sampling_preset: str | None = None
     num_steps: int = 40
     cfg_scale_text: float = 3.0
     cfg_scale_caption: float = 3.0
@@ -347,8 +306,8 @@ def resolve_runtime_dtype(*, precision: str, device: torch.device) -> torch.dtyp
     if mode == "fp32":
         return torch.float32
     if mode == "bf16":
-        if device.type != "cuda":
-            raise ValueError("precision='bf16' currently requires CUDA device.")
+        if device.type not in ("cuda", "xpu"):
+            raise ValueError("precision='bf16' currently requires CUDA or XPU device.")
         return torch.bfloat16
     raise ValueError(f"Unsupported precision={precision!r}. Expected one of: fp32, bf16.")
 
@@ -385,20 +344,11 @@ def resolve_cfg_scales(
     enabled_vals = [value for value in (text_val, speaker_val) if value > 0.0]
     if use_caption_condition and caption_val > 0.0:
         enabled_vals.append(caption_val)
-    # joint モードでは有効なCFGスケールを均一にする必要がある
-    # cfg_scale が未指定でスケール値が異なる場合、有効値の平均で均一化する
     if mode == "joint" and enabled_vals and (max(enabled_vals) - min(enabled_vals) > 1e-6):
-        avg_val = sum(enabled_vals) / len(enabled_vals)
-        messages.append(
-            f"info: cfg_guidance_mode='joint' requires equal scales; "
-            f"averaging enabled values ({enabled_vals}) -> {avg_val:.4f}."
+        raise ValueError(
+            "cfg_guidance_mode='joint' requires equal enabled cfg_scale_text/cfg_scale_caption/cfg_scale_speaker, "
+            "or set cfg_scale."
         )
-        if text_val > 0.0:
-            text_val = avg_val
-        if use_caption_condition and caption_val > 0.0:
-            caption_val = avg_val
-        if speaker_val > 0.0:
-            speaker_val = avg_val
 
     return text_val, caption_val, speaker_val, messages
 
@@ -411,20 +361,25 @@ def _load_torch_checkpoint_payload(path: Path) -> dict:
 
 
 _CONFIG_META_KEY = "config_json"
-_INFERENCE_CONFIG_KEYS = {
+_TEXT_ENCODER_CONFIG_META_KEY = "text_encoder_config_json"
+_INFERENCE_INT_CONFIG_KEYS = {
     "max_text_len",
     "max_caption_len",
     "fixed_target_latent_steps",
 }
+_INFERENCE_FLOAT_CONFIG_KEYS = {"ref_max_seconds"}
+_INFERENCE_CONFIG_KEYS = _INFERENCE_INT_CONFIG_KEYS | _INFERENCE_FLOAT_CONFIG_KEYS
+_LEGACY_MAX_REF_SECONDS = 30.0
 
 
 def _load_checkpoint_from_pt(
     path: Path,
-) -> tuple[dict[str, torch.Tensor], dict, dict | None]:
+) -> tuple[dict[str, torch.Tensor], dict, dict | None, dict | None]:
     ckpt = _load_torch_checkpoint_payload(path)
     model_state = ckpt.get("model")
     model_cfg = ckpt.get("model_config")
     train_cfg = ckpt.get("train_config")
+    text_encoder_config = ckpt.get("text_encoder_config")
 
     if not isinstance(model_state, dict):
         raise ValueError(f"Checkpoint missing model weights dictionary: {path}")
@@ -432,12 +387,21 @@ def _load_checkpoint_from_pt(
         raise ValueError(f"Checkpoint missing model_config dictionary: {path}")
     if train_cfg is not None and not isinstance(train_cfg, dict):
         raise ValueError(f"Checkpoint train_config must be a dictionary when present: {path}")
+    if text_encoder_config is not None and not isinstance(text_encoder_config, dict):
+        raise ValueError(
+            f"Checkpoint text_encoder_config must be a dictionary when present: {path}"
+        )
 
     if checkpoint_state_uses_lora(model_state):
         raise ValueError(
             f"LoRA checkpoints must be loaded from adapter directories or merged safetensors: {path}"
         )
-    return model_state, model_cfg, _extract_inference_train_config(train_cfg)
+    return (
+        model_state,
+        model_cfg,
+        _extract_inference_train_config(train_cfg),
+        text_encoder_config,
+    )
 
 
 def _parse_json_mapping(
@@ -464,8 +428,8 @@ def _extract_inference_train_config(raw: dict | None) -> dict | None:
     if raw is None:
         return None
 
-    inference_cfg: dict[str, int] = {}
-    for key in _INFERENCE_CONFIG_KEYS:
+    inference_cfg: dict[str, int | float] = {}
+    for key in _INFERENCE_INT_CONFIG_KEYS:
         value = raw.get(key)
         if value is None:
             continue
@@ -473,27 +437,62 @@ def _extract_inference_train_config(raw: dict | None) -> dict | None:
             raise ValueError(f"Inference config key '{key}' must be int, got {type(value)!r}.")
         inference_cfg[key] = int(value)
 
+    for key in _INFERENCE_FLOAT_CONFIG_KEYS:
+        value = raw.get(key)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"Inference config key '{key}' must be numeric, got {type(value)!r}.")
+        value_float = float(value)
+        if not math.isfinite(value_float):
+            raise ValueError(f"Inference config key '{key}' must be finite, got {value!r}.")
+        if value_float > 0.0:
+            inference_cfg[key] = value_float
+
     return inference_cfg or None
 
 
 def _split_flat_checkpoint_config(path: Path, flat_config: dict) -> tuple[dict, dict | None]:
     model_cfg: dict[str, object] = {}
-    inference_cfg: dict[str, int] = {}
+    inference_cfg: dict[str, int | float] = {}
     for key, value in flat_config.items():
-        if key in _INFERENCE_CONFIG_KEYS:
+        if key in _INFERENCE_INT_CONFIG_KEYS:
             if not isinstance(value, int):
                 raise ValueError(
                     f"Inference config key '{key}' must be int in checkpoint metadata: {path}"
                 )
             inference_cfg[key] = int(value)
             continue
+        if key in _INFERENCE_FLOAT_CONFIG_KEYS:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(
+                    f"Inference config key '{key}' must be numeric in checkpoint metadata: {path}"
+                )
+            value_float = float(value)
+            if not math.isfinite(value_float):
+                raise ValueError(
+                    f"Inference config key '{key}' must be finite in checkpoint metadata: {path}"
+                )
+            if value_float > 0.0:
+                inference_cfg[key] = value_float
+            continue
         model_cfg[key] = value
     return model_cfg, (inference_cfg or None)
 
 
+def _default_max_ref_seconds(train_cfg: dict | None) -> float:
+    if isinstance(train_cfg, dict):
+        value = train_cfg.get("ref_max_seconds")
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            value_float = float(value)
+            if math.isfinite(value_float) and value_float > 0.0:
+                return value_float
+    return _LEGACY_MAX_REF_SECONDS
+
+
 def _load_checkpoint_from_safetensors(
     path: Path,
-) -> tuple[dict[str, torch.Tensor], dict, dict | None]:
+) -> tuple[dict[str, torch.Tensor], dict, dict | None, dict | None]:
     model_state = load_safetensors_file(str(path), device="cpu")
     if not isinstance(model_state, dict) or not model_state:
         raise ValueError(f"Safetensors checkpoint has no model weights: {path}")
@@ -501,71 +500,94 @@ def _load_checkpoint_from_safetensors(
     with safe_open(str(path), framework="pt", device="cpu") as handle:
         metadata = handle.metadata() or {}
 
+    if parse_quantization_metadata(metadata) is not None:
+        model_state, _ = unflatten_quantized_state_dict(
+            model_state,
+            metadata=metadata,
+        )
+
     flat_config = _parse_json_mapping(
         metadata.get(_CONFIG_META_KEY),
         field=_CONFIG_META_KEY,
         path=path,
         required=True,
     )
+    text_encoder_config = _parse_json_mapping(
+        metadata.get(_TEXT_ENCODER_CONFIG_META_KEY),
+        field=_TEXT_ENCODER_CONFIG_META_KEY,
+        path=path,
+    )
     model_cfg, inference_cfg = _split_flat_checkpoint_config(path=path, flat_config=flat_config)
-    return model_state, model_cfg, inference_cfg
+    return model_state, model_cfg, inference_cfg, text_encoder_config
 
 
 def _load_checkpoint_for_inference(
     path: Path,
-) -> tuple[dict[str, torch.Tensor], dict, dict | None]:
+) -> tuple[dict[str, torch.Tensor], dict, dict | None, dict | None]:
     if path.suffix.lower() == ".safetensors":
         return _load_checkpoint_from_safetensors(path)
     return _load_checkpoint_from_pt(path)
 
 
+def _split_hf_checkpoint_source(source: str) -> tuple[str, str | None]:
+    raw = str(source).strip().strip("/")
+    if not raw:
+        raise ValueError("Hugging Face checkpoint source must be non-empty.")
+    parts = raw.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise ValueError(f"Invalid Hugging Face checkpoint source: {source!r}")
+    if len(parts) <= 2:
+        return raw, None
+    if len(parts) != 3:
+        raise ValueError(
+            "Hugging Face checkpoint subfolders must use owner/repo/subfolder format: "
+            f"{source!r}"
+        )
+    return "/".join(parts[:2]), "/".join(parts[2:])
 
-class _InferenceScope:
-    """並列推論スコープのライフタイムを管理するコンテキストマネージャ
 
-    __enter__ で LoRA context enter → CUDA Stream enter を順に構築し、
-    __exit__ で逆順にクリーンアップする。セマフォは acquire した
-    オブジェクトを保持して release するため、set_max_parallelism で
-    セマフォが再作成されても安全
+def download_hf_checkpoint(source: str) -> str:
+    """Download an Irodori checkpoint and any bundled tokenizer assets.
+
+    ``source`` accepts either a Hugging Face repo id or ``repo_id/subfolder``.
     """
+    from huggingface_hub import snapshot_download
 
-    def __init__(
-        self,
-        runtime: InferenceRuntime,
-        lora_ctx: Any,
-        worker_id: int,
-        semaphore: threading.Semaphore,
-    ) -> None:
-        self._runtime = runtime
-        self._lora_ctx = lora_ctx
-        self._worker_id = worker_id
-        self._semaphore = semaphore
-        self._stream_ctx: Any = None
+    repo_id, subfolder = _split_hf_checkpoint_source(source)
+    if subfolder is None:
+        checkpoint_relative = Path("model.safetensors")
+        allow_patterns = ["model.safetensors", "tokenizer/*"]
+    else:
+        checkpoint_relative = Path(subfolder) / "model.safetensors"
+        allow_patterns = [
+            checkpoint_relative.as_posix(),
+            f"{subfolder}/tokenizer/*",
+            "tokenizer/*",
+        ]
+    snapshot_dir = Path(
+        snapshot_download(
+            repo_id=repo_id,
+            allow_patterns=allow_patterns,
+        )
+    )
+    checkpoint_path = snapshot_dir / checkpoint_relative
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(
+            f"Hugging Face checkpoint source has no model.safetensors: {source}"
+        )
+    return str(checkpoint_path)
 
-    def __enter__(self) -> "_InferenceScope":
-        # LoRA context を開始
-        self._lora_ctx.__enter__()
-        # CUDA Stream を開始
-        self._stream_ctx = self._runtime._inference_stream(self._worker_id)
-        if self._stream_ctx is not None:
-            self._stream_ctx.__enter__()
-        return self
 
-    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> bool:
-        # CUDA Stream のクリーンアップ
-        if self._stream_ctx is not None:
-            self._stream_ctx.__exit__(exc_type, exc_val, exc_tb)
-            self._stream_ctx = None
-        # LoRA context のクリーンアップ
-        if self._lora_ctx is not None:
-            self._lora_ctx.__exit__(exc_type, exc_val, exc_tb)
-            self._lora_ctx = None
-        # セマフォを解放 (取得したオブジェクトを release する)
-        self._semaphore.release()
-        # 実行中スレッド数をデクリメント
-        with self._runtime._active_count_lock:
-            self._runtime._active_count -= 1
-        return False
+def _resolve_tokenizer_source(checkpoint_path: Path, fallback_repo: str) -> tuple[str, bool]:
+    bundled_candidates = (
+        checkpoint_path.parent / "tokenizer",
+        checkpoint_path.parent.parent / "tokenizer",
+    )
+    for bundled in bundled_candidates:
+        if (bundled / "tokenizer_config.json").is_file():
+            return str(bundled), True
+    return fallback_repo, False
+
 
 class InferenceRuntime:
     def __init__(
@@ -580,7 +602,7 @@ class InferenceRuntime:
         codec: DACVAECodec,
         default_text_max_len: int,
         default_caption_max_len: int,
-        max_parallelism: int = 1,
+        default_max_ref_seconds: float = _LEGACY_MAX_REF_SECONDS,
     ) -> None:
         self.key = key
         self.model_device = resolve_runtime_device(key.model_device)
@@ -593,290 +615,14 @@ class InferenceRuntime:
         self.codec = codec
         self.default_text_max_len = default_text_max_len
         self.default_caption_max_len = default_caption_max_len
-        self.watermarker: SilentCipherWatermarker | None = (
-            SilentCipherWatermarker(device=str(self.codec_device))
-            if bool(key.enable_watermark) else None
-        )
-        # 並列推論 (Parallel) 設定
-        max_par = max(1, int(max_parallelism))
-        self._max_parallelism: int = max_par
-        self._max_parallelism_lock = threading.Lock()
-        self._infer_semaphore = threading.Semaphore(max_par)
-        # 現在実行中のスレッド数 (set_max_parallelism でセマフォ正規化に使用)
-        self._active_count: int = 0
-        self._active_count_lock = threading.Lock()
-        # LoRA アダプタ切り替えは排他制御が必要なため Lock を維持
-        # ただし LoRA context manager のライフタイム全体を保持してはならない
-        # (設定変更の瞬間だけ排他にする)
-        # WARNING: LoRA 使用時の並列安全性は完全ではない。
-        # load_lora_adapter は model のモジュール構成を書き換えるため、
-        # 書き換え中に別スレッドが forward を実行すると壊れる可能性がある。
-        # 現状は _lora_lock で書き換えの瞬間だけ排他しているが、
-        # 本来は LoRA 併用時は並列数を 1 に制限するか推論全体をシリアライズすべき
-        self._lora_lock = threading.Lock()
-        self._condition_cache_lock = threading.Lock()
-        self._speaker_condition_cache: OrderedDict[str, EncodedSpeakerCondition] = OrderedDict()
-        self._caption_condition_cache: OrderedDict[str, EncodedCaptionCondition] = OrderedDict()
-        self._condition_cache_max_size = 32
+        self.default_max_ref_seconds = float(default_max_ref_seconds)
+        self.watermarker = SilentCipherWatermarker(device=str(self.codec_device))
+        self._infer_lock = threading.Lock()
         self._model_dtype = next(self.model.parameters()).dtype
         self._lora_adapter_names: dict[str, str] = {}
-        # CUDA Stream プール: max_parallelism に応じて事前構築
-        self._cuda_streams: list[torch.cuda.Stream | None] = []
-        if self.model_device.type == "cuda" and max_par > 1:
-            self._cuda_streams = [torch.cuda.Stream(device=self.model_device) for _ in range(max_par)]
-        # スレッドローカルでワーカーIDを管理し、CUDA Stream を割り当て
-        self._worker_id_counter: int = 0
-        self._worker_id_lock = threading.Lock()
-        # RoPE キャッシュの事前確保: 並列推論時の上書き競合を防ぐ
-        self._rope_max_seq_len: int = 4096
-        self.model.prewarm_rope_cache(self._rope_max_seq_len)
-        # 並列数 2 以上ならタイミング計測の同期をスキップ (スループット向上)
-        self._skip_timing_sync: bool = max_par > 1
-
-    def _acquire_inference_slot(self) -> tuple[int, threading.Semaphore]:
-        """並列推論スロットを取得し、ワーカーIDとセマフォオブジェクトを返す
-
-        セマフォオブジェクトを返すことで、set_max_parallelism でセマフォが
-        再作成された場合でも、実行中スレッドが正しいセマフォを release する。
-        NOTE: self._infer_semaphore の読み取りと acquire の間に
-        set_max_parallelism が挟まるレースが理論上存在するが、
-        古いセマフォの release は無害であり、新しいセマフォが
-        _active_count 分のスロットを予約済みのため実用上問題ない
-        """
-        semaphore = self._infer_semaphore
-        semaphore.acquire()
-        with self._active_count_lock:
-            self._active_count += 1
-        with self._worker_id_lock:
-            wid = self._worker_id_counter
-            self._worker_id_counter = (wid + 1) % max(1, len(self._cuda_streams)) if self._cuda_streams else 0
-        return wid, semaphore
-
-    def _inference_stream(self, worker_id: int) -> Any:
-        """推論用 CUDA Stream コンテキストマネージャを返す
-
-        CUDA が利用できない場合は nullcontext を返すため、
-        非CUDA環境でも透過的に動作する
-        """
-        if not self._cuda_streams:
-            return nullcontext()
-        stream = self._cuda_streams[worker_id] if worker_id < len(self._cuda_streams) else None
-        if stream is None:
-            return nullcontext()
-        return torch.cuda.stream(stream)
-
-    @property
-    def max_parallelism(self) -> int:
-        """現在の最大並列推論数"""
-        with self._max_parallelism_lock:
-            return self._max_parallelism
-
-    def _rebuild_cuda_streams(self, count: int) -> None:
-        """CUDA Stream プールを再構築"""
-        if self.model_device.type == "cuda" and count > 1:
-            self._cuda_streams = [torch.cuda.Stream(device=self.model_device) for _ in range(count)]
-        else:
-            self._cuda_streams = []
-
-    def set_max_parallelism(self, value: int) -> None:
-        """並列推論数を動的に変更
-
-        実行中のリクエストがある場合でも安全に変更可能:
-        - セマフォは再作成して新しい上限を反映
-        - CUDA Stream プールは即座に再構築される
-
-        @param value - 新しい最大並列実行数 (1以上)
-        """
-        new_max = max(1, int(value))
-        with self._max_parallelism_lock:
-            if new_max == self._max_parallelism:
-                return
-            self._max_parallelism = new_max
-        # セマフォを安全に再構築:
-        # 実行中スレッド (active) は新しいセマフォのスロットを占有しているとみなす
-        # Semaphore(new_max + active) で作成し、即座に active 分を acquire して予約する
-        # これにより残りの利用可能スロット = new_max となり、並列数減時も安全に動作する
-        # 実行中スレッドが古いセマフォを release しても、それは誰も acquire しないため無害
-        with self._active_count_lock:
-            active = self._active_count
-        new_semaphore = threading.Semaphore(new_max + active)
-        for _ in range(active):
-            new_semaphore.acquire()
-        self._infer_semaphore = new_semaphore
-        # CUDA Stream プールの再構築
-        self._rebuild_cuda_streams(new_max)
-        # 並列数 2 以上ならタイミング計測の同期をスキップ (スループット向上)
-        self._skip_timing_sync = new_max > 1
-
-    def _apply_sampling_preset(self, req: SamplingRequest, messages: list[str]) -> None:
-        preset = "quality" if req.sampling_preset is None else str(req.sampling_preset).strip().lower()
-        if preset in {"", "none", "off", "custom", "manual"}:
-            return
-        if preset == "quality":
-            return
-        if preset == "balanced":
-            req.num_steps = 30
-            req.cfg_guidance_mode = "alternating"
-            req.cfg_min_t = 0.55
-            req.cfg_max_t = 1.0
-        elif preset == "speed":
-            req.num_steps = 24
-            req.cfg_guidance_mode = "joint"
-            req.cfg_scale = 3.0
-            req.cfg_min_t = 0.6
-            req.cfg_max_t = 1.0
-        elif preset in {"extreme", "extreme-speed", "extreme_speed"}:
-            req.num_steps = 16
-            req.cfg_guidance_mode = "joint"
-            req.cfg_scale = 2.0
-            req.cfg_min_t = 0.7
-            req.cfg_max_t = 1.0
-        else:
-            raise ValueError(
-                f"Unsupported sampling_preset={req.sampling_preset!r}. "
-                "Expected one of: quality, balanced, speed, extreme, custom."
-            )
-        messages.append(
-            "info: applied sampling preset "
-            f"{preset} (steps={req.num_steps}, cfg_mode={req.cfg_guidance_mode}, "
-            f"cfg_scale={req.cfg_scale}, cfg_t=[{req.cfg_min_t}, {req.cfg_max_t}])."
-        )
-
-    def _caption_condition_cache_key(
-        self,
-        *,
-        caption_text: str,
-        caption_ids: torch.Tensor,
-        caption_mask: torch.Tensor,
-    ) -> str:
-        payload = {
-            "version": 1,
-            "checkpoint": str(self.key.checkpoint),
-            "model_device": str(self.model_device),
-            "model_precision": str(self.key.model_precision),
-            "caption_text_sha256": hashlib.sha256(caption_text.encode("utf-8")).hexdigest(),
-            "caption_shape": list(caption_ids.shape),
-            "caption_mask_shape": list(caption_mask.shape),
-            "caption_tokenizer_repo": self.model_cfg.caption_tokenizer_repo_resolved,
-            "caption_add_bos": bool(self.model_cfg.caption_add_bos_resolved),
-        }
-        return _cache_key_hash(payload)
-
-    def _speaker_condition_cache_key(
-        self,
-        *,
-        ref_latent: torch.Tensor | None,
-        ref_mask: torch.Tensor | None,
-        req: SamplingRequest,
-    ) -> str | None:
-        if (
-            ref_latent is None
-            or ref_mask is None
-            or not self.model_cfg.use_speaker_condition_resolved
-        ):
-            return None
-        ref_cpu = ref_latent.detach().to(device="cpu", dtype=torch.float32).contiguous()
-        mask_cpu = ref_mask.detach().to(device="cpu").contiguous()
-        payload = {
-            "version": 1,
-            "checkpoint": str(self.key.checkpoint),
-            "model_device": str(self.model_device),
-            "model_precision": str(self.key.model_precision),
-            "latent_sha256": hashlib.sha256(ref_cpu.numpy().tobytes()).hexdigest(),
-            "mask_sha256": hashlib.sha256(mask_cpu.numpy().tobytes()).hexdigest(),
-            "latent_shape": list(ref_latent.shape),
-            "mask_shape": list(ref_mask.shape),
-            "latent_patch_size": int(self.model_cfg.latent_patch_size),
-            "speaker_patch_size": int(self.model_cfg.speaker_patch_size),
-            "max_ref_seconds": None if req.max_ref_seconds is None else float(req.max_ref_seconds),
-            "ref_normalize_db": None if req.ref_normalize_db is None else float(req.ref_normalize_db),
-            "ref_ensure_max": bool(req.ref_ensure_max),
-        }
-        return _cache_key_hash(payload)
-
-    def _get_or_encode_caption_condition(
-        self,
-        *,
-        caption_text: str,
-        caption_ids: torch.Tensor | None,
-        caption_mask: torch.Tensor | None,
-        messages: list[str],
-    ) -> EncodedCaptionCondition | None:
-        if not self.model_cfg.use_caption_condition:
-            return None
-        if caption_ids is None or caption_mask is None:
-            raise ValueError("caption_ids/caption_mask are required for caption conditioning.")
-        cache_key = self._caption_condition_cache_key(
-            caption_text=caption_text,
-            caption_ids=caption_ids,
-            caption_mask=caption_mask,
-        )
-        with self._condition_cache_lock:
-            cached = _lru_get(self._caption_condition_cache, cache_key)
-        if isinstance(cached, EncodedCaptionCondition):
-            messages.append("info: reused cached caption encoded state.")
-            return cached
-        if self.model.caption_encoder is None or self.model.caption_norm is None:
-            raise RuntimeError("Caption conditioning is enabled but caption modules are missing.")
-        caption_state = self.model.caption_encoder(caption_ids, caption_mask)
-        caption_state = self.model.caption_norm(caption_state)
-        encoded = EncodedCaptionCondition(state=caption_state, mask=caption_mask)
-        with self._condition_cache_lock:
-            _lru_put(
-                self._caption_condition_cache,
-                cache_key,
-                encoded,
-                max_size=self._condition_cache_max_size,
-            )
-        messages.append("info: cached caption encoded state.")
-        return encoded
-
-    def _get_or_encode_speaker_condition(
-        self,
-        *,
-        ref_latent: torch.Tensor | None,
-        ref_mask: torch.Tensor | None,
-        req: SamplingRequest,
-        messages: list[str],
-    ) -> EncodedSpeakerCondition | None:
-        if not self.model_cfg.use_speaker_condition_resolved:
-            return None
-        if ref_latent is None or ref_mask is None:
-            raise ValueError("ref_latent/ref_mask are required for speaker conditioning.")
-        cache_key = self._speaker_condition_cache_key(ref_latent=ref_latent, ref_mask=ref_mask, req=req)
-        if cache_key is not None:
-            with self._condition_cache_lock:
-                cached = _lru_get(self._speaker_condition_cache, cache_key)
-            if isinstance(cached, EncodedSpeakerCondition):
-                messages.append("info: reused cached speaker encoded state.")
-                return cached
-        if self.model.speaker_encoder is None or self.model.speaker_norm is None:
-            raise RuntimeError("Speaker conditioning is enabled but speaker modules are missing.")
-        speaker_latent, speaker_mask = patch_sequence_with_mask(
-            seq=ref_latent,
-            mask=ref_mask,
-            patch_size=self.model_cfg.speaker_patch_size,
-        )
-        speaker_state = self.model.speaker_encoder(speaker_latent, speaker_mask)
-        speaker_state = self.model.speaker_norm(speaker_state)
-        speaker_state, speaker_mask = self.model._prepend_masked_mean_token(
-            speaker_state,
-            speaker_mask,
-        )
-        encoded = EncodedSpeakerCondition(state=speaker_state, mask=speaker_mask)
-        if cache_key is not None:
-            with self._condition_cache_lock:
-                _lru_put(
-                    self._speaker_condition_cache,
-                    cache_key,
-                    encoded,
-                    max_size=self._condition_cache_max_size,
-                )
-            messages.append("info: cached speaker encoded state.")
-        return encoded
 
     @classmethod
-    def from_key(cls, key: RuntimeKey, *, max_parallelism: int = 1) -> InferenceRuntime:
+    def from_key(cls, key: RuntimeKey) -> InferenceRuntime:
         model_device = resolve_runtime_device(key.model_device)
         codec_device = resolve_runtime_device(key.codec_device)
         model_dtype = resolve_runtime_dtype(
@@ -888,13 +634,27 @@ class InferenceRuntime:
             device=codec_device,
         )
 
-        model_state, model_cfg_dict, train_cfg = _load_checkpoint_for_inference(
-            Path(key.checkpoint)
+        checkpoint_path = Path(key.checkpoint)
+        model_state, model_cfg_dict, train_cfg, text_encoder_config = (
+            _load_checkpoint_for_inference(checkpoint_path)
         )
-        model_cfg = ModelConfig(**model_cfg_dict)
+        model_cfg = merge_dataclass_overrides(
+            ModelConfig(),
+            model_cfg_dict,
+            section="checkpoint model_config",
+        )
 
-        model = TextToLatentRFDiT(model_cfg).to(model_device)
-        model.load_state_dict(model_state)
+        model = TextToLatentRFDiT(
+            model_cfg,
+            pretrained_backbone_config=text_encoder_config,
+            load_pretrained_backbone_weights=not model_cfg.use_pretrained_text_encoder,
+        )
+        quantized_model = is_torchao_quantized_state_dict(model_state)
+        model.load_state_dict(
+            model_state,
+            assign=model_cfg.use_pretrained_text_encoder or quantized_model,
+        )
+        model = model.to(model_device)
         model = _move_inference_module(model, device=model_device, dtype=model_dtype)
         model.eval()
         model = _maybe_compile_inference_model(
@@ -903,24 +663,42 @@ class InferenceRuntime:
             dynamic=bool(key.compile_dynamic),
         )
 
-        tokenizer = PretrainedTextTokenizer.from_pretrained(
-            repo_id=model_cfg.text_tokenizer_repo,
-            add_bos=bool(model_cfg.text_add_bos),
-            local_files_only=False,
+        text_tokenizer_source, text_tokenizer_is_local = _resolve_tokenizer_source(
+            checkpoint_path,
+            model_cfg.text_tokenizer_repo,
         )
-        if tokenizer.vocab_size != model_cfg.text_vocab_size:
+        tokenizer = PretrainedTextTokenizer.from_pretrained(
+            repo_id=text_tokenizer_source,
+            add_bos=bool(model_cfg.text_add_bos),
+            local_files_only=text_tokenizer_is_local,
+            revision=None if text_tokenizer_is_local else model_cfg.text_encoder_revision,
+        )
+        if (
+            not model_cfg.use_pretrained_text_encoder
+            and tokenizer.vocab_size != model_cfg.text_vocab_size
+        ):
             raise ValueError(
                 f"text_vocab_size mismatch: checkpoint text_vocab_size={model_cfg.text_vocab_size} but tokenizer "
                 f"({model_cfg.text_tokenizer_repo}) vocab_size={tokenizer.vocab_size}."
             )
         caption_tokenizer = None
         if model_cfg.use_caption_condition:
-            caption_tokenizer = PretrainedTextTokenizer.from_pretrained(
-                repo_id=model_cfg.caption_tokenizer_repo_resolved,
-                add_bos=model_cfg.caption_add_bos_resolved,
-                local_files_only=False,
+            caption_tokenizer_source, caption_tokenizer_is_local = _resolve_tokenizer_source(
+                checkpoint_path,
+                model_cfg.caption_tokenizer_repo_resolved,
             )
-            if caption_tokenizer.vocab_size != model_cfg.caption_vocab_size_resolved:
+            caption_tokenizer = PretrainedTextTokenizer.from_pretrained(
+                repo_id=caption_tokenizer_source,
+                add_bos=model_cfg.caption_add_bos_resolved,
+                local_files_only=caption_tokenizer_is_local,
+                revision=(
+                    None if caption_tokenizer_is_local else model_cfg.text_encoder_revision
+                ),
+            )
+            if (
+                not model_cfg.use_pretrained_text_encoder
+                and caption_tokenizer.vocab_size != model_cfg.caption_vocab_size_resolved
+            ):
                 raise ValueError(
                     f"caption_vocab_size mismatch: checkpoint caption_vocab_size={model_cfg.caption_vocab_size_resolved} but tokenizer ({model_cfg.caption_tokenizer_repo_resolved}) "
                     f"vocab_size={caption_tokenizer.vocab_size}."
@@ -928,6 +706,7 @@ class InferenceRuntime:
 
         default_text_max_len = 256
         default_caption_max_len = default_text_max_len
+        default_max_ref_seconds = _default_max_ref_seconds(train_cfg)
         if isinstance(train_cfg, dict):
             ckpt_text_max_len = train_cfg.get("max_text_len")
             if isinstance(ckpt_text_max_len, int) and ckpt_text_max_len > 0:
@@ -961,59 +740,8 @@ class InferenceRuntime:
             codec=codec,
             default_text_max_len=default_text_max_len,
             default_caption_max_len=default_caption_max_len,
-            max_parallelism=max_parallelism,
+            default_max_ref_seconds=default_max_ref_seconds,
         )
-
-    def _reference_latent_cache_path(self, *, req: SamplingRequest) -> Path | None:
-        if req.ref_wav is None:
-            return None
-
-        cache_payload = {
-            "version": 1,
-            "source_sha256": _hash_file(req.ref_wav),
-            "codec_repo": self.key.codec_repo,
-            "codec_deterministic_encode": bool(self.key.codec_deterministic_encode),
-            "codec_sample_rate": int(self.codec.sample_rate),
-            "codec_hop_length": int(self.codec.model.hop_length),
-            "model_latent_dim": int(self.model_cfg.latent_dim),
-            "max_ref_seconds": None if req.max_ref_seconds is None else float(req.max_ref_seconds),
-            "ref_normalize_db": None if req.ref_normalize_db is None else float(req.ref_normalize_db),
-            "ref_ensure_max": bool(req.ref_ensure_max),
-        }
-        cache_name = f"{_cache_key_hash(cache_payload)}.pt"
-        return Path("cache") / "latent" / cache_name
-
-    def _load_cached_reference_latent(self, cache_path: Path, messages: list[str]) -> torch.Tensor | None:
-        if not cache_path.exists():
-            return None
-        try:
-            latent = torch.load(cache_path, map_location="cpu", weights_only=True)
-            if not isinstance(latent, torch.Tensor):
-                raise ValueError(f"cached payload is {type(latent)!r}, not torch.Tensor")
-        except Exception as exc:
-            messages.append(
-                f"warning: failed to load cached reference latent ({cache_path}): {exc}. Re-encoding reference audio."
-            )
-            return None
-
-        messages.append(f"info: loaded cached reference latent: {cache_path}")
-        return latent
-
-    def _save_cached_reference_latent(
-        self,
-        *,
-        cache_path: Path,
-        ref_latent: torch.Tensor,
-        messages: list[str],
-    ) -> None:
-        try:
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp_path = cache_path.with_name(f".{cache_path.name}.{secrets.token_hex(8)}.tmp")
-            torch.save(ref_latent.cpu(), tmp_path)
-            tmp_path.replace(cache_path)
-            messages.append(f"info: saved reference latent cache: {cache_path}")
-        except Exception as exc:
-            messages.append(f"warning: failed to save reference latent cache ({cache_path}): {exc}")
 
     def _resolve_lora_adapter_path(self, adapter_path: str | None) -> str | None:
         if adapter_path is None:
@@ -1113,8 +841,29 @@ class InferenceRuntime:
         messages: list[str],
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         runtime_dtype = next(self.model.parameters()).dtype
+        max_ref_seconds = (
+            self.default_max_ref_seconds
+            if req.max_ref_seconds is None
+            else float(req.max_ref_seconds)
+        )
+        wav_paths = ([req.ref_wav] if req.ref_wav is not None else []) + list(
+            req.ref_wavs or []
+        )
+        latent_paths = ([req.ref_latent] if req.ref_latent is not None else []) + list(
+            req.ref_latents or []
+        )
+        if req.ref_wav is not None and req.ref_wavs:
+            raise ValueError("ref_wav and ref_wavs cannot be used together.")
+        if req.ref_latent is not None and req.ref_latents:
+            raise ValueError("ref_latent and ref_latents cannot be used together.")
+        if wav_paths and latent_paths:
+            raise ValueError("Waveform and latent reference inputs cannot be mixed.")
+        if any(not isinstance(path, str) or not path.strip() for path in wav_paths):
+            raise ValueError("Reference waveform paths must be non-empty strings.")
+        if any(not isinstance(path, str) or not path.strip() for path in latent_paths):
+            raise ValueError("Reference latent paths must be non-empty strings.")
         if not self.model_cfg.use_speaker_condition_resolved:
-            if req.ref_wav is not None or req.ref_latent is not None:
+            if wav_paths or latent_paths:
                 messages.append(
                     "info: speaker conditioning is disabled for this checkpoint; ignoring reference input."
                 )
@@ -1135,65 +884,92 @@ class InferenceRuntime:
             )
             return ref_latent_patched, ref_mask
 
-        if req.ref_wav is None and req.ref_latent is None:
-            raise ValueError("Specify either ref_wav/ref_latent, or set no_ref=True.")
+        if not wav_paths and not latent_paths:
+            raise ValueError(
+                "Specify ref_wav/ref_wavs/ref_latent/ref_latents, or set no_ref=True."
+            )
 
         max_ref_latent_steps = None
-        if req.max_ref_seconds is not None and req.max_ref_seconds > 0:
+        if max_ref_seconds > 0:
             max_ref_latent_steps = max(
                 1,
                 math.ceil(
-                    float(req.max_ref_seconds)
+                    max_ref_seconds
                     * float(self.codec.sample_rate)
                     / float(int(self.codec.model.hop_length))
                 ),
             )
 
-        if req.ref_latent is not None:
-            latent_raw = torch.load(req.ref_latent, map_location="cpu", weights_only=True)
-            ref_latent = _coerce_latent_shape(
-                latent_raw, latent_dim=self.model_cfg.latent_dim
-            ).unsqueeze(0)
-            ref_latent = ref_latent.to(dtype=runtime_dtype)
+        if latent_paths:
+            latent_pieces: list[torch.Tensor] = []
+            for path in latent_paths:
+                latent_raw = torch.load(path, map_location="cpu", weights_only=True)
+                piece = _coerce_latent_shape(
+                    latent_raw, latent_dim=self.model_cfg.latent_dim
+                ).unsqueeze(0)
+                if piece.shape[1] == 0:
+                    raise ValueError(f"Reference latent is empty: {path}")
+                latent_pieces.append(piece.to(dtype=runtime_dtype))
+                if (
+                    max_ref_latent_steps is not None
+                    and sum(int(item.shape[1]) for item in latent_pieces)
+                    >= max_ref_latent_steps
+                ):
+                    break
+            ref_latent = torch.cat(latent_pieces, dim=1)
+            if len(latent_paths) > 1:
+                messages.append(
+                    f"info: concatenated {len(latent_pieces)}/{len(latent_paths)} reference latents "
+                    f"in input order ({ref_latent.shape[1]} steps before max-length trimming)."
+                )
         else:
-            cache_path = self._reference_latent_cache_path(req=req)
-            ref_latent = None if cache_path is None else self._load_cached_reference_latent(cache_path, messages)
-            if ref_latent is None:
-                wav, sr = _load_audio(req.ref_wav)
-                if req.max_ref_seconds is not None and req.max_ref_seconds > 0:
-                    max_ref_samples = max(1, int(float(req.max_ref_seconds) * float(sr)))
+            if req.ref_normalize_db is not None:
+                messages.append(
+                    f"info: reference loudness normalize enabled per clip (target_db={float(req.ref_normalize_db):.2f}, includes peak safety scaling)."
+                )
+            elif req.ref_ensure_max:
+                messages.append(
+                    "info: reference peak safety scaling enabled per clip (ensure_max=True)."
+                )
+            latent_pieces = []
+            for path in wav_paths:
+                wav, sr = _load_audio(path)
+                if len(wav_paths) == 1 and max_ref_seconds > 0:
+                    max_ref_samples = max(1, int(max_ref_seconds * float(sr)))
                     if wav.shape[1] > max_ref_samples:
                         messages.append(
-                            f"warning: reference audio exceeds max_ref_seconds ({req.max_ref_seconds}s). "
+                            f"warning: reference audio exceeds max_ref_seconds ({max_ref_seconds}s). "
                             f"Trimming from {float(wav.shape[1]) / float(sr):.2f}s to {float(max_ref_samples) / float(sr):.2f}s."
                         )
                         wav = wav[:, :max_ref_samples]
-                if req.ref_normalize_db is not None:
-                    messages.append(
-                        f"info: reference loudness normalize enabled (target_db={float(req.ref_normalize_db):.2f}, includes peak safety scaling)."
-                    )
-                elif req.ref_ensure_max:
-                    messages.append("info: reference peak safety scaling enabled (ensure_max=True).")
-                ref_latent = self.codec.encode_waveform(
+                piece = self.codec.encode_waveform(
                     wav.unsqueeze(0),
                     sample_rate=int(sr),
                     normalize_db=req.ref_normalize_db,
                     ensure_max=bool(req.ref_ensure_max),
                 ).cpu()
-                if cache_path is not None:
-                    self._save_cached_reference_latent(
-                        cache_path=cache_path,
-                        ref_latent=ref_latent,
-                        messages=messages,
-                    )
-            else:
-                ref_latent = _coerce_latent_shape(ref_latent, latent_dim=self.model_cfg.latent_dim).unsqueeze(0)
-            ref_latent = ref_latent.to(dtype=runtime_dtype)
+                if piece.shape[1] == 0:
+                    raise ValueError(f"Reference waveform produced an empty latent: {path}")
+                latent_pieces.append(piece)
+                if (
+                    max_ref_latent_steps is not None
+                    and sum(int(item.shape[1]) for item in latent_pieces)
+                    >= max_ref_latent_steps
+                ):
+                    break
+            ref_latent = torch.cat(latent_pieces, dim=1)
+            if len(wav_paths) > 1:
+                messages.append(
+                    f"info: encoded and concatenated {len(latent_pieces)}/{len(wav_paths)} "
+                    "reference waveforms in input order "
+                    f"({ref_latent.shape[1]} latent steps before max-length trimming)."
+                )
 
         if max_ref_latent_steps is not None and ref_latent.shape[1] > max_ref_latent_steps:
             messages.append(
-                f"warning: reference latent steps ({ref_latent.shape[1]}) exceed max_ref_seconds bound ({max_ref_latent_steps} steps). "
-                "Trimming reference latent."
+                f"warning: combined reference latent steps ({ref_latent.shape[1]}) exceed "
+                f"max_ref_seconds bound ({max_ref_latent_steps} steps). "
+                "Trimming the concatenated reference latent."
             )
             ref_latent = ref_latent[:, :max_ref_latent_steps]
 
@@ -1231,9 +1007,15 @@ class InferenceRuntime:
                 "info: speaker conditioning is disabled for this checkpoint; ignoring speaker embedding."
             )
             return None, None
-        if req.ref_wav is not None or req.ref_latent is not None or req.no_ref:
+        if (
+            req.ref_wav is not None
+            or req.ref_wavs
+            or req.ref_latent is not None
+            or req.ref_latents
+            or req.no_ref
+        ):
             raise ValueError(
-                "ref_embed/--ref-embed cannot be combined with ref_wav/ref_latent/no_ref. "
+                "ref_embed/--ref-embed cannot be combined with reference inputs or no_ref. "
                 "Use exactly one speaker conditioning source."
             )
 
@@ -1262,9 +1044,6 @@ class InferenceRuntime:
                 log_fn(msg)
 
         messages: list[str] = []
-        self._apply_sampling_preset(req, messages)
-        for msg in messages:
-            _log(msg)
         _log(
             (
                 "[runtime] start synthesize "
@@ -1275,7 +1054,7 @@ class InferenceRuntime:
                 self.key.model_precision,
                 self.key.codec_device,
                 self.key.codec_precision,
-                self.key.enable_watermark and (self.watermarker is not None and self.watermarker.ready),
+                self.watermarker.ready,
                 req.cfg_guidance_mode,
                 req.seconds,
                 req.num_steps,
@@ -1399,46 +1178,30 @@ class InferenceRuntime:
         else:
             used_seed = int(req.seed)
             _log(f"[runtime] using seed: {used_seed}")
-        # LoRA アダプタの設定は排他制御 (同じモデル重みを共有するため並列アダプタ変更不可)
-        # ただしロックは設定の瞬間だけ: context manager のライフタイム全体は保持しない
-        with self._lora_lock:
-            lora_ctx = self._prepare_lora_for_request(
+        post_load_t0 = _measure_start(self.model_device, self.codec_device)
+
+        with (
+            self._infer_lock,
+            self._prepare_lora_for_request(
                 req.lora_adapter,
                 messages=messages,
                 stage_timings=stage_timings,
                 log_fn=_log,
-            )
-        # _lora_lock はここで解放: 設定完了後は並列推論 (Parallel) 可能
-
-        # 並列推論スロット取得 → LoRA/Stream を一括管理
-        worker_id, semaphore = self._acquire_inference_slot()
-        # スロット確保後から total_to_decode 計測開始 (セマフォ待ち時間を除外)
-        post_load_t0 = _measure_start(self.model_device, self.codec_device, skip_timing_sync=self._skip_timing_sync)
-        scope = _InferenceScope(self, lora_ctx, worker_id, semaphore)
-        with scope, torch.inference_mode():
-            # 以下、推論本体
-            t0 = _measure_start(self.model_device, skip_timing_sync=self._skip_timing_sync)
+            ),
+            torch.inference_mode(),
+        ):
+            t0 = _measure_start(self.model_device)
             text_ids, text_mask = self.tokenizer.batch_encode(
                 [normalized_text] * num_candidates,
                 max_length=text_max_len,
             )
-            original_text_len = int(text_ids.shape[1])
-            text_ids, text_mask, trimmed_text_len = _trim_batch_to_masked_length(
-                text_ids,
-                text_mask,
-                min_length=1,
-            )
-            stage_sec = _measure_end(self.model_device, t0, skip_timing_sync=self._skip_timing_sync)
+            stage_sec = _measure_end(self.model_device, t0)
             stage_timings.append(("tokenize_text", stage_sec))
-            _log(
-                f"[runtime] tokenize_text: {stage_sec * 1000.0:.1f} ms "
-                f"(len {original_text_len} -> {trimmed_text_len})"
-            )
+            _log(f"[runtime] tokenize_text: {stage_sec * 1000.0:.1f} ms")
             text_ids = text_ids.to(self.model_device)
             text_mask = text_mask.to(self.model_device)
             caption_ids = None
             caption_mask = None
-            caption_text = ""
             if self.model_cfg.use_caption_condition:
                 if self.caption_tokenizer is None:
                     raise RuntimeError(
@@ -1451,17 +1214,10 @@ class InferenceRuntime:
                 )
                 if caption_text == "":
                     caption_mask.zero_()
-                original_caption_len = int(caption_ids.shape[1])
-                caption_ids, caption_mask, trimmed_caption_len = _trim_batch_to_masked_length(
-                    caption_ids,
-                    caption_mask,
-                    min_length=1,
-                )
-                _log(f"[runtime] caption_tokens: len {original_caption_len} -> {trimmed_caption_len}")
                 caption_ids = caption_ids.to(self.model_device)
                 caption_mask = caption_mask.to(self.model_device)
 
-            t0 = _measure_start(self.model_device, self.codec_device, skip_timing_sync=self._skip_timing_sync)
+            t0 = _measure_start(self.model_device, self.codec_device)
             msg_count_before_ref = len(messages)
             (
                 speaker_state_override,
@@ -1479,7 +1235,7 @@ class InferenceRuntime:
                 )
             else:
                 ref_latent, ref_mask = None, None
-            stage_sec = _measure_end(self.model_device, t0, self.codec_device, skip_timing_sync=self._skip_timing_sync)
+            stage_sec = _measure_end(self.model_device, t0, self.codec_device)
             stage_timings.append(("prepare_reference", stage_sec))
             for msg in messages[msg_count_before_ref:]:
                 _log(msg)
@@ -1501,7 +1257,7 @@ class InferenceRuntime:
                 messages.append(duration_msg)
                 _log(duration_msg)
             elif self.model_cfg.use_duration_predictor:
-                t0 = _measure_start(self.model_device, skip_timing_sync=self._skip_timing_sync)
+                t0 = _measure_start(self.model_device)
                 has_speaker_duration = torch.zeros(
                     (num_candidates,), dtype=torch.bool, device=self.model_device
                 )
@@ -1558,7 +1314,7 @@ class InferenceRuntime:
                 latent_steps = int(round(scaled_frames))
                 latent_steps = max(min_frames, min(max_frames, latent_steps))
                 target_samples = int(latent_steps * hop_length)
-                stage_sec = _measure_end(self.model_device, t0, skip_timing_sync=self._skip_timing_sync)
+                stage_sec = _measure_end(self.model_device, t0)
                 stage_timings.append(("predict_duration", stage_sec))
                 msg = (
                     f"info: predicted duration frames={pred_frames:.1f}, "
@@ -1587,43 +1343,7 @@ class InferenceRuntime:
                     messages.append(msg)
                     _log(msg)
 
-            t0 = _measure_start(self.model_device, skip_timing_sync=self._skip_timing_sync)
-            msg_count_before_conditions = len(messages)
-            text_state = self.model.text_encoder(text_ids, text_mask)
-            text_state = self.model.text_norm(text_state)
-            if speaker_state_override is not None and speaker_mask_override is not None:
-                speaker_encoded = EncodedSpeakerCondition(
-                    state=speaker_state_override,
-                    mask=speaker_mask_override,
-                )
-            else:
-                speaker_encoded = self._get_or_encode_speaker_condition(
-                    ref_latent=ref_latent,
-                    ref_mask=ref_mask,
-                    req=req,
-                    messages=messages,
-                )
-            caption_encoded = self._get_or_encode_caption_condition(
-                caption_text=caption_text,
-                caption_ids=caption_ids,
-                caption_mask=caption_mask,
-                messages=messages,
-            )
-            encoded_conditions = (
-                text_state,
-                text_mask,
-                None if speaker_encoded is None else speaker_encoded.state,
-                None if speaker_encoded is None else speaker_encoded.mask,
-                None if caption_encoded is None else caption_encoded.state,
-                None if caption_encoded is None else caption_encoded.mask,
-            )
-            stage_sec = _measure_end(self.model_device, t0, skip_timing_sync=self._skip_timing_sync)
-            stage_timings.append(("encode_conditions", stage_sec))
-            for msg in messages[msg_count_before_conditions:]:
-                _log(msg)
-            _log(f"[runtime] encode_conditions: {stage_sec * 1000.0:.1f} ms")
-
-            t0 = _measure_start(self.model_device, skip_timing_sync=self._skip_timing_sync)
+            t0 = _measure_start(self.model_device)
             z_patched = sample_euler_rf_cfg(
                 model=self.model,
                 text_input_ids=text_ids,
@@ -1651,26 +1371,25 @@ class InferenceRuntime:
                 speaker_kv_scale=speaker_kv_scale,
                 speaker_kv_max_layers=speaker_kv_max_layers,
                 speaker_kv_min_t=speaker_kv_min_t,
-                encoded_conditions=encoded_conditions,
                 t_schedule_mode=str(req.t_schedule_mode),
                 sway_coeff=float(req.sway_coeff),
             )
-            stage_sec = _measure_end(self.model_device, t0, skip_timing_sync=self._skip_timing_sync)
+            stage_sec = _measure_end(self.model_device, t0)
             stage_timings.append(("sample_rf", stage_sec))
             _log(f"[runtime] sample_rf: {stage_sec * 1000.0:.1f} ms")
 
-            t0 = _measure_start(self.model_device, skip_timing_sync=self._skip_timing_sync)
+            t0 = _measure_start(self.model_device)
             z = unpatchify_latent(
                 z_patched,
                 patch_size=self.model_cfg.latent_patch_size,
                 latent_dim=self.model_cfg.latent_dim,
             )
-            stage_sec = _measure_end(self.model_device, t0, skip_timing_sync=self._skip_timing_sync)
+            stage_sec = _measure_end(self.model_device, t0)
             stage_timings.append(("unpatchify_latent", stage_sec))
             _log(f"[runtime] unpatchify_latent: {stage_sec * 1000.0:.1f} ms")
             z = z[:, :latent_steps]
 
-            t0 = _measure_start(self.model_device, self.codec_device, skip_timing_sync=self._skip_timing_sync)
+            t0 = _measure_start(self.model_device, self.codec_device)
             trimmed_audios: list[torch.Tensor] = []
             if decode_mode == "batch":
                 audio_batch = self.codec.decode_latent(z).cpu()
@@ -1707,35 +1426,30 @@ class InferenceRuntime:
                         if flattening_samples > 0:
                             max_samples = min(max_samples, flattening_samples)
                     trimmed_audios.append(audio_i[:, :max_samples])
-            stage_sec = _measure_end(self.model_device, t0, self.codec_device, skip_timing_sync=self._skip_timing_sync)
+            stage_sec = _measure_end(self.model_device, t0, self.codec_device)
             stage_timings.append(("decode_latent", stage_sec))
             _log(f"[runtime] decode_latent ({decode_mode}): {stage_sec * 1000.0:.1f} ms")
 
-            if self.watermarker is not None and self.watermarker.ready:
-                t0 = _measure_start(self.codec_device, skip_timing_sync=self._skip_timing_sync)
+            if self.watermarker.ready:
+                t0 = _measure_start(self.codec_device)
                 trimmed_audios = self.watermarker.encode_batch(
                     trimmed_audios,
                     sample_rate=int(self.codec.sample_rate),
                 )
-                stage_sec = _measure_end(self.codec_device, t0, skip_timing_sync=self._skip_timing_sync)
+                stage_sec = _measure_end(self.codec_device, t0)
                 stage_timings.append(("silentcipher_watermark", stage_sec))
                 _log(f"[runtime] silentcipher_watermark: {stage_sec * 1000.0:.1f} ms")
-            elif self.watermarker is None:
-                # watermark が明示的に無効化されている場合は info として記録
-                pass
             else:
-                # watermarker は作成済みだが SilentCipher モデルがロードできなかった
                 msg = (
-                    "warning: SilentCipher watermark model is unavailable; generated audio was not "
+                    "warning: SilentCipher watermark is unavailable; generated audio was not "
                     "watermarked."
                 )
                 messages.append(msg)
                 _log(msg)
 
-            total_to_decode = _measure_end(self.model_device, post_load_t0, self.codec_device, skip_timing_sync=self._skip_timing_sync)
+            total_to_decode = _measure_end(self.model_device, post_load_t0, self.codec_device)
             _log(f"[runtime] total_to_decode: {total_to_decode:.3f} s")
 
-        # _InferenceScope.__exit__ がセマフォ解放・Stream終了・LoRA終了を処理
         _log("[runtime] done synthesize")
         return SamplingResult(
             audio=trimmed_audios[0],
@@ -1745,612 +1459,6 @@ class InferenceRuntime:
             total_to_decode=total_to_decode,
             used_seed=used_seed,
             messages=messages,
-        )
-    # ## 長文分割読み上げ
-
-    def _synthesize_long_batch(
-        self,
-        req: LongTextSamplingRequest,
-        segments: list[SplitSegment],
-        chunk_index: int,
-        *,
-        # 事前計算済みの共通条件 (synthesize_long で1回だけ前処理)
-        ref_latent_single: torch.Tensor | None,
-        ref_mask_single: torch.Tensor | None,
-        speaker_state_override: torch.Tensor | None,
-        speaker_mask_override: torch.Tensor | None,
-        speaker_encoded_single: EncodedSpeakerCondition | None,
-        caption_ids: torch.Tensor | None,
-        caption_mask: torch.Tensor | None,
-        caption_encoded: EncodedCaptionCondition | None,
-        has_caption_text: bool,
-        cfg_scale_text: float,
-        cfg_scale_caption: float,
-        cfg_scale_speaker: float,
-        cfg_mode: str,
-        truncation_factor: float | None,
-        rescale_k: float | None,
-        rescale_sigma: float | None,
-        speaker_kv_scale: float | None,
-        speaker_kv_min_t: float | None,
-        speaker_kv_max_layers: int | None,
-        base_seed: int,
-        log_fn: Callable[[str], None] | None = None,
-    ) -> tuple[list[torch.Tensor], list[tuple[str, float]], list[str]]:
-        """
-        ### _synthesize_long_batch
-        セグメント群を1バッチとして推論し、各セグメントの音声を返す
-
-        synthesize_long からチャンクごとに呼び出される内部メソッド。
-        共通前処理 (speaker, caption, CFG等) は synthesize_long 側で
-        1回だけ実行済みであり、ここではチャンク固有の処理のみを行う
-
-        @param req - 長文分割読み上げリクエスト
-        @param segments - このバッチで処理するセグメント群
-        @param chunk_index - チャンク番号 (ログ用)
-        @param ref_latent_single - 事前計算済み参照 latent (batch=1, patched)
-        @param ref_mask_single - 事前計算済み参照 mask (batch=1)
-        @param speaker_state_override - 事前計算済み speaker embedding state (batch=1)
-        @param speaker_mask_override - 事前計算済み speaker embedding mask (batch=1)
-        @param speaker_encoded_single - 事前計算済みエンコード済み speaker 条件 (batch=1)
-        @param caption_ids - 事前計算済み caption token IDs (batch=1)
-        @param caption_mask - 事前計算済み caption mask (batch=1)
-        @param caption_encoded - 事前計算済みエンコード済み caption 条件 (batch=1)
-        @param has_caption_text - caption テキストが有効か
-        @param cfg_scale_text - CFG text スケール
-        @param cfg_scale_caption - CFG caption スケール
-        @param cfg_scale_speaker - CFG speaker スケール
-        @param cfg_mode - CFG モード
-        @param truncation_factor - truncation factor
-        @param rescale_k - rescale k
-        @param rescale_sigma - rescale sigma
-        @param speaker_kv_scale - speaker KV scale
-        @param speaker_kv_min_t - speaker KV min t
-        @param speaker_kv_max_layers - speaker KV max layers
-        @param base_seed - ベースシード値
-        @param log_fn - ログ出力関数
-        @returns (セグメント音声一覧, タイミング, メッセージ) のタプル
-        """
-        def _log(msg: str) -> None:
-            if log_fn is not None:
-                log_fn(msg)
-
-        messages: list[str] = []
-        num_segments = len(segments)
-
-        raw_texts = [seg.text for seg in segments]
-        normalized_texts = [normalize_text(t).strip() for t in raw_texts]
-
-        text_max_len = (
-            self.default_text_max_len if req.max_text_len is None else int(req.max_text_len)
-        )
-
-        stage_timings: list[tuple[str, float]] = []
-
-        # テキストトークン化 (バッチ: チャンクごとに異なる)
-        t0 = _measure_start(self.model_device, skip_timing_sync=self._skip_timing_sync)
-        text_ids, text_mask = self.tokenizer.batch_encode(
-            normalized_texts,
-            max_length=text_max_len,
-        )
-        text_ids, text_mask, _trimmed_len = _trim_batch_to_masked_length(
-            text_ids, text_mask, min_length=1,
-        )
-        text_ids = text_ids.to(self.model_device)
-        text_mask = text_mask.to(self.model_device)
-        stage_sec = _measure_end(self.model_device, t0, skip_timing_sync=self._skip_timing_sync)
-        stage_timings.append((f"c{chunk_index}_tokenize", stage_sec))
-        _log(f"[long] chunk[{chunk_index}] tokenize: {stage_sec * 1000.0:.1f} ms (batch={num_segments})")
-
-        # 共通条件をバッチサイズに展開
-        # ref_latent / ref_mask: batch=1 → num_segments
-        if ref_latent_single is not None:
-            ref_latent = ref_latent_single.expand(num_segments, -1, -1).contiguous()
-        else:
-            ref_latent = None
-        if ref_mask_single is not None:
-            ref_mask = ref_mask_single.expand(num_segments, -1).contiguous()
-        else:
-            ref_mask = None
-
-        # speaker_state_override / mask: batch=1 → num_segments
-        if speaker_state_override is not None:
-            ss_override = speaker_state_override.expand(num_segments, -1, -1).contiguous()
-        else:
-            ss_override = None
-        if speaker_mask_override is not None:
-            sm_override = speaker_mask_override.expand(num_segments, -1).contiguous()
-        else:
-            sm_override = None
-
-        # caption_ids / mask: batch=1 → num_segments
-        if caption_ids is not None:
-            c_ids = caption_ids.expand(num_segments, -1).contiguous()
-        else:
-            c_ids = None
-        if caption_mask is not None:
-            c_mask = caption_mask.expand(num_segments, -1).contiguous()
-        else:
-            c_mask = None
-
-        # speaker_encoded: batch=1 → num_segments
-        if speaker_encoded_single is not None:
-            speaker_state_exp = speaker_encoded_single.state.expand(num_segments, -1, -1).contiguous()
-            speaker_mask_exp = speaker_encoded_single.mask.expand(num_segments, -1).contiguous()
-            speaker_encoded = EncodedSpeakerCondition(
-                state=speaker_state_exp, mask=speaker_mask_exp,
-            )
-        else:
-            speaker_encoded = None
-
-        # caption_encoded: batch=1 → num_segments
-        if caption_encoded is not None:
-            caption_state_exp = caption_encoded.state.expand(num_segments, -1, -1).contiguous()
-            caption_mask_exp = caption_encoded.mask.expand(num_segments, -1).contiguous()
-            caption_encoded_exp = EncodedCaptionCondition(
-                state=caption_state_exp, mask=caption_mask_exp,
-            )
-        else:
-            caption_encoded_exp = None
-
-        # Duration prediction (バッチ)
-        hop_length = int(self.codec.model.hop_length)
-        min_seconds = 0.5
-        max_seconds = float(req.max_segment_seconds)
-
-        if self.model_cfg.use_duration_predictor:
-            t0 = _measure_start(self.model_device, skip_timing_sync=self._skip_timing_sync)
-            has_speaker_duration = torch.zeros((num_segments,), dtype=torch.bool, device=self.model_device)
-            if sm_override is not None:
-                has_speaker_duration = sm_override.any(dim=1)
-            elif ref_mask is not None and self.model_cfg.use_speaker_condition_resolved:
-                has_speaker_duration = ref_mask.any(dim=1)
-
-            duration_features = build_duration_features(
-                normalized_texts,
-                token_counts=text_mask.sum(dim=1),
-                max_text_len=text_max_len,
-                has_speaker=has_speaker_duration,
-            ).to(self.model_device)
-
-            (
-                dur_text_state, dur_text_mask,
-                dur_speaker_state, _dur_speaker_mask,
-                _dur_caption_state, _dur_caption_mask,
-            ) = self.model.encode_conditions(
-                text_input_ids=text_ids,
-                text_mask=text_mask,
-                ref_latent=ref_latent,
-                ref_mask=ref_mask,
-                caption_input_ids=c_ids,
-                caption_mask=c_mask,
-                speaker_state_override=ss_override,
-                speaker_mask_override=sm_override,
-                speaker_uncond_mode=req.speaker_uncond_mode,
-            )
-            pred_log_frames = self.model.predict_duration_log_frames(
-                text_state=dur_text_state,
-                text_mask=dur_text_mask,
-                speaker_state=dur_speaker_state,
-                speaker_mask=_dur_speaker_mask,
-                caption_state=_dur_caption_state,
-                caption_mask=_dur_caption_mask,
-                duration_features=duration_features,
-                has_speaker=has_speaker_duration,
-                has_caption=torch.full(
-                    (num_segments,), has_caption_text,
-                    dtype=torch.bool, device=self.model_device,
-                ) if self.model_cfg.use_caption_condition else None,
-            )
-            pred_frame_values = torch.expm1(pred_log_frames).float()
-            min_frames = max(1, math.ceil(min_seconds * self.codec.sample_rate / hop_length))
-            max_frames = max(1, math.floor(max_seconds * self.codec.sample_rate / hop_length))
-            scaled_frames = pred_frame_values * float(req.duration_scale)
-            latent_steps_list: list[int] = []
-            for sf in scaled_frames.tolist():
-                steps_i = max(min_frames, min(max_frames, int(round(sf))))
-                latent_steps_list.append(steps_i)
-            target_samples_list = [s * hop_length for s in latent_steps_list]
-            stage_sec = _measure_end(self.model_device, t0, skip_timing_sync=self._skip_timing_sync)
-            stage_timings.append((f"c{chunk_index}_duration", stage_sec))
-            for i, (pf, ls) in enumerate(zip(pred_frame_values.tolist(), latent_steps_list)):
-                msg = (f"[long] chunk[{chunk_index}] seg[{i}] predicted frames={pf:.1f}, "
-                       f"using_frames={ls} ({target_samples_list[i] / float(self.codec.sample_rate):.3f}s)")
-                _log(msg)
-        else:
-            fallback_seconds = 30.0
-            latent_steps_list = [
-                math.ceil(int(fallback_seconds * self.codec.sample_rate) / hop_length)
-            ] * num_segments
-            target_samples_list = [s * hop_length for s in latent_steps_list]
-            msg = "info: checkpoint has no duration predictor; falling back to 30.000s per segment."
-            messages.append(msg)
-
-        max_latent_steps = max(latent_steps_list)
-        patched_steps = math.ceil(max_latent_steps / self.model_cfg.latent_patch_size)
-
-        if isinstance(self.train_cfg, dict):
-            fixed_steps = self.train_cfg.get("fixed_target_latent_steps")
-            if isinstance(fixed_steps, int) and fixed_steps > 0 and max_latent_steps > fixed_steps:
-                messages.append(
-                    f"warning: max latent length ({max_latent_steps}) exceeds "
-                    f"fixed_target_latent_steps ({fixed_steps})."
-                )
-
-        # 条件エンコード (テキストのみバッチごとに異なる; speaker/captionは事前計算済み)
-        t0 = _measure_start(self.model_device, skip_timing_sync=self._skip_timing_sync)
-        text_state = self.model.text_encoder(text_ids, text_mask)
-        text_state = self.model.text_norm(text_state)
-        encoded_conditions = (
-            text_state, text_mask,
-            None if speaker_encoded is None else speaker_encoded.state,
-            None if speaker_encoded is None else speaker_encoded.mask,
-            None if caption_encoded_exp is None else caption_encoded_exp.state,
-            None if caption_encoded_exp is None else caption_encoded_exp.mask,
-        )
-        stage_sec = _measure_end(self.model_device, t0, skip_timing_sync=self._skip_timing_sync)
-        stage_timings.append((f"c{chunk_index}_encode", stage_sec))
-        _log(f"[long] chunk[{chunk_index}] encode_conditions: {stage_sec * 1000.0:.1f} ms")
-
-        # Diffusion sampling
-        _log(f"[long] chunk[{chunk_index}] sampling {num_segments} segments (patched_steps={patched_steps})...")
-        t0 = _measure_start(self.model_device, skip_timing_sync=self._skip_timing_sync)
-        z_patched = sample_euler_rf_cfg(
-            model=self.model,
-            text_input_ids=text_ids,
-            text_mask=text_mask,
-            ref_latent=ref_latent,
-            ref_mask=ref_mask,
-            sequence_length=patched_steps,
-            caption_input_ids=c_ids,
-            caption_mask=c_mask,
-            speaker_state_override=ss_override,
-            speaker_mask_override=sm_override,
-            speaker_uncond_mode=req.speaker_uncond_mode,
-            num_steps=int(req.num_steps),
-            cfg_scale_text=cfg_scale_text,
-            cfg_scale_caption=cfg_scale_caption,
-            cfg_scale_speaker=cfg_scale_speaker,
-            cfg_guidance_mode=cfg_mode,
-            cfg_min_t=float(req.cfg_min_t),
-            cfg_max_t=float(req.cfg_max_t),
-            seed=base_seed,
-            truncation_factor=truncation_factor,
-            rescale_k=rescale_k,
-            rescale_sigma=rescale_sigma,
-            use_context_kv_cache=bool(req.context_kv_cache),
-            speaker_kv_scale=speaker_kv_scale,
-            speaker_kv_max_layers=speaker_kv_max_layers,
-            speaker_kv_min_t=speaker_kv_min_t,
-            encoded_conditions=encoded_conditions,
-            t_schedule_mode=str(req.t_schedule_mode),
-            sway_coeff=float(req.sway_coeff),
-        )
-        stage_sec = _measure_end(self.model_device, t0, skip_timing_sync=self._skip_timing_sync)
-        stage_timings.append((f"c{chunk_index}_sample", stage_sec))
-        _log(f"[long] chunk[{chunk_index}] sample_rf: {stage_sec * 1000.0:.1f} ms")
-
-        # Unpatchify & トリム
-        t0 = _measure_start(self.model_device, skip_timing_sync=self._skip_timing_sync)
-        z = unpatchify_latent(
-            z_patched,
-            patch_size=self.model_cfg.latent_patch_size,
-            latent_dim=self.model_cfg.latent_dim,
-        )
-        stage_sec = _measure_end(self.model_device, t0, skip_timing_sync=self._skip_timing_sync)
-        stage_timings.append((f"c{chunk_index}_unpatchify", stage_sec))
-
-        z_segments: list[torch.Tensor] = []
-        for i in range(num_segments):
-            z_segments.append(z[i : i + 1, : latent_steps_list[i], :])
-
-        # Codec decode (バッチ: パディング→デコード→トリム)
-        t0 = _measure_start(self.model_device, self.codec_device, skip_timing_sync=self._skip_timing_sync)
-        z_padded = torch.zeros(
-            num_segments, max_latent_steps, self.model_cfg.latent_dim,
-            device=z.device, dtype=z.dtype,
-        )
-        for i in range(num_segments):
-            z_padded[i, : latent_steps_list[i], :] = z_segments[i][0]
-
-        audio_batch = self.codec.decode_latent(z_padded).cpu()
-
-        trimmed_audios: list[torch.Tensor] = []
-        for i in range(num_segments):
-            audio_i = audio_batch[i]
-            max_samples = target_samples_list[i]
-            if bool(req.trim_tail):
-                flattening_point = find_flattening_point(
-                    z_segments[i][0],
-                    window_size=max(1, int(req.tail_window_size)),
-                    std_threshold=float(req.tail_std_threshold),
-                    mean_threshold=float(req.tail_mean_threshold),
-                )
-                flattening_samples = int(flattening_point * hop_length)
-                if flattening_samples > 0:
-                    max_samples = min(max_samples, flattening_samples)
-            trimmed_audios.append(audio_i[:, :max_samples])
-
-        stage_sec = _measure_end(self.model_device, t0, self.codec_device, skip_timing_sync=self._skip_timing_sync)
-        stage_timings.append((f"c{chunk_index}_decode", stage_sec))
-        _log(f"[long] chunk[{chunk_index}] decode: {stage_sec * 1000.0:.1f} ms")
-
-        # Watermark
-        if self.watermarker is not None and self.watermarker.ready:
-            t0 = _measure_start(self.codec_device, skip_timing_sync=self._skip_timing_sync)
-            trimmed_audios = self.watermarker.encode_batch(
-                trimmed_audios, sample_rate=int(self.codec.sample_rate),
-            )
-            stage_sec = _measure_end(self.codec_device, t0, skip_timing_sync=self._skip_timing_sync)
-            stage_timings.append((f"c{chunk_index}_watermark", stage_sec))
-        elif self.watermarker is not None and not self.watermarker.ready:
-            messages.append("warning: SilentCipher watermark model is unavailable; generated audio was not watermarked.")
-
-        return trimmed_audios, stage_timings, messages
-
-    def synthesize_long(
-        self,
-        req: LongTextSamplingRequest,
-        *,
-        log_fn: Callable[[str], None] | None = None,
-    ) -> LongTextSamplingResult:
-        """
-        ### synthesize_long
-        長文テキストを分割してバッチ推論し、結果を結合して返す
-
-        テキストは自然な区切りで自動分割され、各セグメントは diffusion 最大時間内に
-        収まるよう制御される。セグメント数が max_batch_segments を超える場合は
-        チャンクごとに分割して逐次バッチ処理する
-
-        ### 処理フロー
-        1. テキスト分割 → セグメントリスト
-        2. 共通前処理 (参照音声, speaker, caption, CFG等) を1回だけ実行
-        3. セグメントを max_batch_segments 件ずつチャンクに分割
-        4. 各チャンクを _synthesize_long_batch でバッチ推論
-        5. 全チャンク結果を無音区間挟みで結合
-
-        @param req - 長文分割読み上げリクエスト
-        @param log_fn - ログ出力関数
-        @returns セグメント音声を結合した全体音声とセグメント詳細
-        """
-        def _log(msg: str) -> None:
-            if log_fn is not None:
-                log_fn(msg)
-
-        # テキスト分割
-        split_result: LongTextSplitResult = split_long_text(
-            req.text,
-            max_seconds=req.max_segment_seconds,
-            max_chars=req.max_segment_chars,
-            chars_per_second=req.chars_per_second,
-            min_segment_chars=req.min_segment_chars,
-            duration_scale=float(req.duration_scale),
-        )
-
-        num_segments = len(split_result.segments)
-        max_batch = max(1, int(req.max_batch_segments))
-        _log(f"[long] split into {num_segments} segments (wasSplit={split_result.wasSplit})")
-        for idx, seg in enumerate(split_result.segments):
-            trunc = "..." if len(seg.text) > 50 else ""
-            _log(f"[long] segment[{idx}]: \"{seg.text[:50]}{trunc}\" est={seg.estimatedSeconds:.1f}s")
-        _log(f"[long] max_batch_segments={max_batch}")
-
-        # LoRA / スロット取得 (全体で1回だけ)
-        all_messages: list[str] = []
-        overall_stage_timings: list[tuple[str, float]] = []
-
-        with self._lora_lock:
-            lora_ctx = self._prepare_lora_for_request(
-                req.lora_adapter,
-                messages=all_messages,
-                stage_timings=overall_stage_timings,
-                log_fn=_log,
-            )
-
-        worker_id, semaphore = self._acquire_inference_slot()
-        overall_t0 = _measure_start(self.model_device, self.codec_device, skip_timing_sync=self._skip_timing_sync)
-        scope = _InferenceScope(self, lora_ctx, worker_id, semaphore)
-
-        with scope, torch.inference_mode():
-            # ## 共通前処理: 参照 latent, speaker, caption, CFG等を1回だけ計算
-            text_max_len = (
-                self.default_text_max_len if req.max_text_len is None else int(req.max_text_len)
-            )
-            caption_max_len = (
-                self.default_caption_max_len
-                if req.max_caption_len is None
-                else int(req.max_caption_len)
-            )
-            has_caption_text = bool(
-                self.model_cfg.use_caption_condition
-                and req.caption is not None
-                and str(req.caption).strip() != ""
-            )
-            cfg_mode = str(req.cfg_guidance_mode).strip().lower()
-
-            cfg_scale_text, cfg_scale_caption, cfg_scale_speaker, scale_messages = resolve_cfg_scales(
-                cfg_guidance_mode=cfg_mode,
-                cfg_scale_text=req.cfg_scale_text,
-                cfg_scale_caption=req.cfg_scale_caption,
-                cfg_scale_speaker=req.cfg_scale_speaker,
-                cfg_scale=req.cfg_scale,
-                use_caption_condition=has_caption_text,
-                use_speaker_condition=bool(
-                    self.model_cfg.use_speaker_condition_resolved and not req.no_ref
-                ),
-            )
-            all_messages.extend(scale_messages)
-
-            truncation_factor = None if req.truncation_factor is None else float(req.truncation_factor)
-            rescale_k = None if req.rescale_k is None else float(req.rescale_k)
-            rescale_sigma = None if req.rescale_sigma is None else float(req.rescale_sigma)
-            speaker_kv_scale = None if req.speaker_kv_scale is None else float(req.speaker_kv_scale)
-            speaker_kv_min_t = None
-            speaker_kv_max_layers = (
-                None if req.speaker_kv_max_layers is None else int(req.speaker_kv_max_layers)
-            )
-            if speaker_kv_scale is not None:
-                speaker_kv_min_t = 0.9 if req.speaker_kv_min_t is None else float(req.speaker_kv_min_t)
-
-            base_seed = req.seed if req.seed is not None else secrets.randbelow(2**31)
-
-            # 参照 latent (batch=1 で1回だけロード/エンコード)
-            t0 = _measure_start(self.model_device, self.codec_device, skip_timing_sync=self._skip_timing_sync)
-            speaker_req = SamplingRequest(
-                text="",
-                ref_wav=req.ref_wav,
-                ref_latent=req.ref_latent,
-                ref_embed=req.ref_embed,
-                no_ref=req.no_ref,
-                ref_normalize_db=req.ref_normalize_db,
-                ref_ensure_max=req.ref_ensure_max,
-                max_ref_seconds=req.max_ref_seconds,
-                speaker_uncond_mode=req.speaker_uncond_mode,
-            )
-            (
-                speaker_state_override,
-                speaker_mask_override,
-            ) = self._load_speaker_embedding_condition(
-                req=speaker_req,
-                batch_size=1,
-                messages=all_messages,
-            )
-            if speaker_state_override is None:
-                ref_latent_single, ref_mask_single = self._load_reference_latent(
-                    req=speaker_req,
-                    batch_size=1,
-                    messages=all_messages,
-                )
-            else:
-                ref_latent_single, ref_mask_single = None, None
-            stage_sec = _measure_end(self.model_device, t0, self.codec_device, skip_timing_sync=self._skip_timing_sync)
-            overall_stage_timings.append(("long_reference", stage_sec))
-            _log(f"[long] reference load+encode: {stage_sec * 1000.0:.1f} ms")
-
-            # speaker エンコード (batch=1 で1回だけ)
-            t0 = _measure_start(self.model_device, skip_timing_sync=self._skip_timing_sync)
-            if speaker_state_override is not None and speaker_mask_override is not None:
-                speaker_encoded_single = EncodedSpeakerCondition(
-                    state=speaker_state_override, mask=speaker_mask_override,
-                )
-            else:
-                speaker_encoded_single = self._get_or_encode_speaker_condition(
-                    ref_latent=ref_latent_single, ref_mask=ref_mask_single,
-                    req=speaker_req, messages=all_messages,
-                )
-            stage_sec = _measure_end(self.model_device, t0, skip_timing_sync=self._skip_timing_sync)
-            overall_stage_timings.append(("long_speaker_encode", stage_sec))
-            _log(f"[long] speaker encode: {stage_sec * 1000.0:.1f} ms")
-
-            # caption トークン化とエンコード (batch=1 で1回だけ)
-            caption_ids = None
-            caption_mask = None
-            caption_encoded = None
-            caption_text = ""
-            if self.model_cfg.use_caption_condition:
-                if self.caption_tokenizer is None:
-                    raise RuntimeError("Caption conditioning is enabled but caption tokenizer is not loaded.")
-                caption_text = "" if req.caption is None else str(req.caption).strip()
-                caption_ids, caption_mask = self.caption_tokenizer.batch_encode(
-                    [caption_text],
-                    max_length=caption_max_len,
-                )
-                if caption_text == "":
-                    caption_mask.zero_()
-                caption_ids, caption_mask, _ = _trim_batch_to_masked_length(
-                    caption_ids, caption_mask, min_length=1,
-                )
-                caption_ids = caption_ids.to(self.model_device)
-                caption_mask = caption_mask.to(self.model_device)
-                caption_encoded = self._get_or_encode_caption_condition(
-                    caption_text=caption_text,
-                    caption_ids=caption_ids,
-                    caption_mask=caption_mask,
-                    messages=all_messages,
-                )
-
-            # ## チャンク分割 & バッチ/逐次ループ
-            all_segments = list(split_result.segments)
-            chunks: list[list[SplitSegment]] = []
-            for start in range(0, num_segments, max_batch):
-                chunks.append(all_segments[start : start + max_batch])
-
-            _log(f"[long] processing {num_segments} segments in {len(chunks)} chunk(s)")
-            all_segment_audios: list[torch.Tensor] = []
-
-            for chunk_idx, chunk_segments in enumerate(chunks):
-                _log(f"[long] --- chunk[{chunk_idx}] ({len(chunk_segments)} segments) ---")
-                chunk_audios, chunk_timings, chunk_messages = self._synthesize_long_batch(
-                    req=req,
-                    segments=chunk_segments,
-                    chunk_index=chunk_idx,
-                    ref_latent_single=ref_latent_single,
-                    ref_mask_single=ref_mask_single,
-                    speaker_state_override=speaker_state_override,
-                    speaker_mask_override=speaker_mask_override,
-                    speaker_encoded_single=speaker_encoded_single,
-                    caption_ids=caption_ids,
-                    caption_mask=caption_mask,
-                    caption_encoded=caption_encoded,
-                    has_caption_text=has_caption_text,
-                    cfg_scale_text=cfg_scale_text,
-                    cfg_scale_caption=cfg_scale_caption,
-                    cfg_scale_speaker=cfg_scale_speaker,
-                    cfg_mode=cfg_mode,
-                    truncation_factor=truncation_factor,
-                    rescale_k=rescale_k,
-                    rescale_sigma=rescale_sigma,
-                    speaker_kv_scale=speaker_kv_scale,
-                    speaker_kv_min_t=speaker_kv_min_t,
-                    speaker_kv_max_layers=speaker_kv_max_layers,
-                    base_seed=base_seed,
-                    log_fn=_log,
-                )
-                all_segment_audios.extend(chunk_audios)
-                overall_stage_timings.extend(chunk_timings)
-                all_messages.extend(chunk_messages)
-
-        # 無音結合: 前後無音トリム + gap無音挿入
-        sample_rate = int(self.codec.sample_rate)
-        gap_samples = int(req.segment_gap_seconds * sample_rate)
-        gap_silence = torch.zeros(1, gap_samples, dtype=torch.float32, device="cpu")
-        trim_db = float(req.segment_trim_silence_db)
-
-        parts: list[torch.Tensor] = []
-        segment_audios: list[torch.Tensor] = []
-        for seg_idx, seg_audio in enumerate(all_segment_audios):
-            audio_2d = seg_audio.detach().cpu().to(dtype=torch.float32)
-            if audio_2d.ndim == 1:
-                audio_2d = audio_2d.unsqueeze(0)
-            elif audio_2d.ndim == 2 and audio_2d.shape[0] != 1:
-                audio_2d = audio_2d[:1, :]
-            # 各セグメントの前後無音をトリム: これで「ぶつ切り」感を除去
-            audio_2d = trim_leading_silence(audio_2d, threshold_db=trim_db)
-            audio_2d = trim_trailing_silence(audio_2d, threshold_db=trim_db)
-            segment_audios.append(audio_2d)
-            parts.append(audio_2d)
-            # 最後のセグメント以外は gap 分の無音区間を挟む
-            if seg_idx < len(all_segment_audios) - 1 and gap_samples > 0:
-                parts.append(gap_silence)
-
-        combined_audio = torch.cat(parts, dim=1) if parts else torch.zeros(1, 1, dtype=torch.float32)
-
-        total_to_decode = _measure_end(self.model_device, overall_t0, self.codec_device, skip_timing_sync=self._skip_timing_sync)
-        overall_stage_timings.append(("long_total", total_to_decode))
-        _log(f"[long] done: {num_segments} segments in {len(chunks)} chunks, combined duration={combined_audio.shape[-1] / sample_rate:.2f}s")
-
-        used_seed = req.seed if req.seed is not None else 0
-
-        return LongTextSamplingResult(
-            audio=combined_audio,
-            audios=[combined_audio],
-            sample_rate=sample_rate,
-            stage_timings=overall_stage_timings,
-            total_to_decode=total_to_decode,
-            used_seed=used_seed,
-            messages=all_messages,
-            segments=list(split_result.segments),
-            segment_audios=segment_audios,
         )
 
     def unload(self) -> None:
@@ -2365,6 +1473,10 @@ class InferenceRuntime:
                 mps = getattr(torch, "mps", None)
                 if mps is not None and hasattr(mps, "empty_cache"):
                     mps.empty_cache()
+            elif device.type == "xpu":
+                xpu = getattr(torch, "xpu", None)
+                if xpu is not None and hasattr(xpu, "empty_cache"):
+                    xpu.empty_cache()
 
 
 _RUNTIME_CACHE_LOCK = threading.Lock()
@@ -2372,18 +1484,14 @@ _RUNTIME_CACHE_KEY: RuntimeKey | None = None
 _RUNTIME_CACHE_VALUE: InferenceRuntime | None = None
 
 
-def get_cached_runtime(key: RuntimeKey, *, max_parallelism: int = 1) -> tuple[InferenceRuntime, bool]:
+def get_cached_runtime(key: RuntimeKey) -> tuple[InferenceRuntime, bool]:
     global _RUNTIME_CACHE_KEY, _RUNTIME_CACHE_VALUE
     with _RUNTIME_CACHE_LOCK:
         if _RUNTIME_CACHE_VALUE is not None and _RUNTIME_CACHE_KEY == key:
-            runtime = _RUNTIME_CACHE_VALUE
-            # キャッシュヒット時も max_parallelism が異なれば並列数を動的に反映
-            if max_parallelism > 1 and runtime.max_parallelism != max(1, int(max_parallelism)):
-                runtime.set_max_parallelism(int(max_parallelism))
-            return runtime, False
+            return _RUNTIME_CACHE_VALUE, False
 
         old_runtime = _RUNTIME_CACHE_VALUE
-        runtime = InferenceRuntime.from_key(key, max_parallelism=max_parallelism)
+        runtime = InferenceRuntime.from_key(key)
         _RUNTIME_CACHE_KEY = key
         _RUNTIME_CACHE_VALUE = runtime
 
@@ -2402,19 +1510,6 @@ def clear_cached_runtime() -> None:
 
     if runtime is not None:
         runtime.unload()
-
-
-def _hash_file(path: str | Path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _cache_key_hash(payload: dict[str, object]) -> str:
-    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def _load_audio(path: str | Path) -> tuple[torch.Tensor, int]:
@@ -2444,191 +1539,3 @@ def save_wav(path: str | Path, audio: torch.Tensor, sample_rate: int) -> Path:
         audio_np = audio_cpu.squeeze(0).numpy() if audio_cpu.shape[0] == 1 else audio_cpu.T.numpy()
         sf.write(str(out_path), audio_np, sample_rate)
     return out_path
-
-
-def _trim_batch_to_masked_length(
-    ids: torch.Tensor,
-    mask: torch.Tensor,
-    *,
-    min_length: int = 1,
-) -> tuple[torch.Tensor, torch.Tensor, int]:
-    """Trim right-padding columns that are fully masked across the batch."""
-    if ids.ndim != 2 or mask.ndim != 2:
-        raise ValueError(f"Expected ids/mask ndim=2, got ids={tuple(ids.shape)} mask={tuple(mask.shape)}")
-    if ids.shape != mask.shape:
-        raise ValueError(f"ids/mask shape mismatch: ids={tuple(ids.shape)} mask={tuple(mask.shape)}")
-    keep_len = int(min_length)
-    if bool(mask.any().item()):
-        keep_len = max(keep_len, int(mask.any(dim=0).nonzero()[-1].item()) + 1)
-    keep_len = max(1, min(int(ids.shape[1]), keep_len))
-    return ids[:, :keep_len].contiguous(), mask[:, :keep_len].contiguous(), keep_len
-
-
-def _lru_get(cache: OrderedDict[str, object], key: str) -> object | None:
-    value = cache.get(key)
-    if value is None:
-        return None
-    cache.move_to_end(key)
-    return value
-
-
-def _lru_put(cache: OrderedDict[str, object], key: str, value: object, *, max_size: int) -> None:
-    cache[key] = value
-    cache.move_to_end(key)
-    while len(cache) > max(1, int(max_size)):
-        cache.popitem(last=False)
-
-
-@dataclass
-class EncodedSpeakerCondition:
-    state: torch.Tensor
-    mask: torch.Tensor
-
-
-@dataclass
-class EncodedCaptionCondition:
-    state: torch.Tensor
-    mask: torch.Tensor
-
-
-
-@dataclass
-class LongTextSamplingRequest:
-    """長文分割読み上げ向けリクエスト
-
-    通常の SamplingRequest とは別に、テキスト分割パラメータを保持する。
-    基本パラメータ (text, ref_wav 等) は SamplingRequest と共通だが、
-    duration_scale は各セグメントの予測時間に適用され、話速を調整する
-    """
-    text: str
-    caption: str | None = None
-    ref_wav: str | None = None
-    ref_latent: str | None = None
-    ref_embed: str | None = None
-    no_ref: bool = False
-    ref_normalize_db: float | None = -16.0
-    ref_ensure_max: bool = True
-    num_candidates: int = 1
-    decode_mode: str = "sequential"
-    max_ref_seconds: float | None = 30.0
-    max_text_len: int | None = None
-    max_caption_len: int | None = None
-    sampling_preset: str | None = None
-    num_steps: int = 40
-    cfg_scale_text: float = 3.0
-    cfg_scale_caption: float = 3.0
-    cfg_scale_speaker: float = 5.0
-    cfg_guidance_mode: str = "independent"
-    cfg_scale: float | None = None
-    cfg_min_t: float = 0.5
-    cfg_max_t: float = 1.0
-    truncation_factor: float | None = None
-    rescale_k: float | None = None
-    rescale_sigma: float | None = None
-    context_kv_cache: bool = True
-    speaker_kv_scale: float | None = None
-    speaker_kv_min_t: float | None = None
-    speaker_kv_max_layers: int | None = None
-    speaker_uncond_mode: str = "mask"
-    seed: int | None = None
-    t_schedule_mode: str = "linear"
-    sway_coeff: float = -1.0
-    trim_tail: bool = True
-    tail_window_size: int = 20
-    tail_std_threshold: float = 0.05
-    tail_mean_threshold: float = 0.1
-    lora_adapter: str | None = None
-    # 長文分割固有パラメータ
-    max_segment_seconds: float = 30.0
-    max_segment_chars: int = 180
-    chars_per_second: float = 10.0
-    min_segment_chars: int = 4
-    # セグメントごとの話速スケール (>1 遅く, <1 速く)
-    duration_scale: float = 1.0
-    # セグメント結合時の前後無音トリムしきい値 (dB)。-40 ≈ 振幅1%
-    segment_trim_silence_db: float = -40.0
-    # セグメント間の無音区間 (秒)
-    # 前後無音をトリムしたセグメント同士の間に挟む無音の長さ
-    segment_gap_seconds: float = 0.2
-    # 1回のバッチで同時に処理するセグメント最大数
-    max_batch_segments: int = 8
-
-
-@dataclass
-class LongTextSamplingResult:
-    """長文分割読み上げの結果
-
-    セグメントごとの音声を結合した全体音声と、セグメント一覧を保持する
-    """
-    audio: torch.Tensor
-    audios: list[torch.Tensor]
-    sample_rate: int
-    stage_timings: list[tuple[str, float]]
-    total_to_decode: float
-    used_seed: int
-    messages: list[str]
-    segments: list[SplitSegment]
-    segment_audios: list[torch.Tensor]
-
-
-def _build_per_segment_request(
-    long_req: LongTextSamplingRequest,
-    segment_text: str,
-    segment_index: int,
-    base_seed: int | None,
-) -> SamplingRequest:
-    """LongTextSamplingRequest の共通パラメータを受け継いで
-    セグメントごとの SamplingRequest を構築する
-
-    継承されないフィールド: text, seconds
-    - seed は base_seed + segment_index で決定的に振る
-    """
-    seg_seed: int | None = None
-    if base_seed is not None:
-        seg_seed = base_seed + segment_index
-    return SamplingRequest(
-        text=segment_text,
-        caption=long_req.caption,
-        ref_wav=long_req.ref_wav,
-        ref_latent=long_req.ref_latent,
-        ref_embed=long_req.ref_embed,
-        no_ref=long_req.no_ref,
-        ref_normalize_db=long_req.ref_normalize_db,
-        ref_ensure_max=long_req.ref_ensure_max,
-        num_candidates=1,
-        # セグメントごとに1候補だけ生成し、結合後に全体を返す
-        decode_mode=long_req.decode_mode,
-        seconds=None,
-        # 手動秒数指定せず duration predictor に自動予測させる
-        duration_scale=1.0,
-        min_seconds=0.5,
-        max_seconds=long_req.max_segment_seconds,
-        max_ref_seconds=long_req.max_ref_seconds,
-        max_text_len=long_req.max_text_len,
-        max_caption_len=long_req.max_caption_len,
-        sampling_preset=long_req.sampling_preset,
-        num_steps=long_req.num_steps,
-        cfg_scale_text=long_req.cfg_scale_text,
-        cfg_scale_caption=long_req.cfg_scale_caption,
-        cfg_scale_speaker=long_req.cfg_scale_speaker,
-        cfg_guidance_mode=long_req.cfg_guidance_mode,
-        cfg_scale=long_req.cfg_scale,
-        cfg_min_t=long_req.cfg_min_t,
-        cfg_max_t=long_req.cfg_max_t,
-        truncation_factor=long_req.truncation_factor,
-        rescale_k=long_req.rescale_k,
-        rescale_sigma=long_req.rescale_sigma,
-        context_kv_cache=long_req.context_kv_cache,
-        speaker_kv_scale=long_req.speaker_kv_scale,
-        speaker_kv_min_t=long_req.speaker_kv_min_t,
-        speaker_kv_max_layers=long_req.speaker_kv_max_layers,
-        speaker_uncond_mode=long_req.speaker_uncond_mode,
-        seed=seg_seed,
-        t_schedule_mode=long_req.t_schedule_mode,
-        sway_coeff=long_req.sway_coeff,
-        trim_tail=long_req.trim_tail,
-        tail_window_size=long_req.tail_window_size,
-        tail_std_threshold=long_req.tail_std_threshold,
-        tail_mean_threshold=long_req.tail_mean_threshold,
-        lora_adapter=long_req.lora_adapter,
-    )

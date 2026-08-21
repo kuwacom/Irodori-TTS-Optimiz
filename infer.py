@@ -5,14 +5,12 @@ import argparse
 import math
 from pathlib import Path
 
-from huggingface_hub import hf_hub_download
-
 from irodori_tts.inference_runtime import (
     InferenceRuntime,
-    LongTextSamplingRequest,
     RuntimeKey,
     SamplingRequest,
     default_runtime_device,
+    download_hf_checkpoint,
     resolve_cfg_scales,
     save_wav,
 )
@@ -52,10 +50,7 @@ def _resolve_checkpoint_path(args: argparse.Namespace) -> str:
     if repo_id == "":
         raise ValueError("hf_checkpoint must be non-empty.")
 
-    checkpoint_path = hf_hub_download(
-        repo_id=repo_id,
-        filename="model.safetensors",
-    )
+    checkpoint_path = download_hf_checkpoint(repo_id)
     print(
         f"[checkpoint] downloaded model.safetensors from hf://{repo_id} -> {checkpoint_path}",
         flush=True,
@@ -75,8 +70,8 @@ def main() -> None:
         "--hf-checkpoint",
         default=None,
         help=(
-            "Hugging Face model repo id to download model.safetensors from "
-            "(e.g. your-org/your-model)."
+            "Hugging Face model repo id or repo/subfolder containing model.safetensors "
+            "(e.g. your-org/your-model or your-org/your-model/int8-weight-only)."
         ),
     )
     parser.add_argument(
@@ -131,8 +126,11 @@ def main() -> None:
     parser.add_argument(
         "--max-ref-seconds",
         type=float,
-        default=30.0,
-        help="Maximum reference duration in seconds. Set <=0 to disable the cap.",
+        default=None,
+        help=(
+            "Maximum reference duration in seconds. By default, use the checkpoint "
+            "recommendation (30 seconds for legacy checkpoints). Set <=0 to disable the cap."
+        ),
     )
     parser.add_argument(
         "--ref-normalize-db",
@@ -173,15 +171,6 @@ def main() -> None:
         ),
     )
     parser.add_argument("--num-steps", type=int, default=40)
-    parser.add_argument(
-        "--sampling-preset",
-        choices=["quality", "balanced", "speed", "extreme", "custom"],
-        default="custom",
-        help=(
-            "Sampling speed/quality preset. "
-            "quality/custom keep explicit arguments; balanced/speed/extreme override steps and CFG mode/range."
-        ),
-    )
     parser.add_argument(
         "--t-schedule-mode",
         choices=["linear", "sway"],
@@ -237,13 +226,6 @@ def main() -> None:
         default=False,
         help="Use dynamic=True for torch.compile (default: disabled).",
     )
-    parser.add_argument(
-        "--enable-watermark",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Enable SilentCipher watermark on generated audio (default: disabled for speed).",
-    )
-
     parser.add_argument("--cfg-scale-text", type=float, default=3.0)
     parser.add_argument("--cfg-scale-caption", type=float, default=3.0)
     parser.add_argument("--cfg-scale-speaker", type=float, default=5.0)
@@ -369,9 +351,31 @@ def main() -> None:
         help="Reference waveform path for speaker conditioning.",
     )
     ref_group.add_argument(
+        "--ref-wavs",
+        nargs="+",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Reference waveform paths to encode separately and concatenate in input order "
+            "before applying the checkpoint's maximum reference length. For v4-Small long-reference "
+            "cloning, prefer multiple shorter clips from the same speaker; this matches training. "
+            "A single uninterrupted long recording is accepted but has not been evaluated."
+        ),
+    )
+    ref_group.add_argument(
         "--ref-latent",
         default=None,
         help="Reference latent (.pt) path for speaker conditioning.",
+    )
+    ref_group.add_argument(
+        "--ref-latents",
+        nargs="+",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Reference latent (.pt) paths to concatenate in input order before applying "
+            "the checkpoint's maximum reference length."
+        ),
     )
     ref_group.add_argument(
         "--ref-embed",
@@ -385,62 +389,6 @@ def main() -> None:
             "Run without speaker reference conditioning. Valid for text-only or "
             "text+caption-only inference even when the checkpoint supports speaker conditioning."
         ),
-    )
-
-    # 長文分割読み上げオプション
-    long_text_group = parser.add_argument_group("long text splitting")
-    long_text_group.add_argument(
-        "--long-text",
-        action="store_true",
-        default=False,
-        help=(
-            "Enable long text splitting mode. Instead of a single diffusion pass, "
-            "the input text is split at natural boundaries and each segment is "
-            "synthesized separately then concatenated. Overrides --seconds, "
-            "--duration-scale, and --num-candidates."
-        ),
-    )
-    long_text_group.add_argument(
-        "--max-segment-seconds",
-        type=float,
-        default=30.0,
-        help="Maximum estimated duration per segment in seconds (default: 30).",
-    )
-    long_text_group.add_argument(
-        "--max-segment-chars",
-        type=int,
-        default=180,
-        help="Maximum character count per segment before forced cut (default: 180).",
-    )
-    long_text_group.add_argument(
-        "--chars-per-second",
-        type=float,
-        default=10.0,
-        help="Estimated characters per second for duration prediction (default: 10).",
-    )
-    long_text_group.add_argument(
-        "--min-segment-chars",
-        type=int,
-        default=4,
-        help="Minimum characters per segment; shorter segments are merged (default: 4).",
-    )
-    long_text_group.add_argument(
-        "--segment-gap",
-        type=float,
-        default=0.2,
-        help="Gap duration in seconds between concatenated segments after trimming edge silence (default: 0.2). ゆったりめのキャラクターでは 0.4 程度に広げると自然。",
-    )
-    long_text_group.add_argument(
-        "--segment-trim-silence-db",
-        type=float,
-        default=-40.0,
-        help="Threshold in dB for trimming leading/trailing silence from each segment (-40 ≈ 1%% amplitude, default: -40.0).",
-    )
-    long_text_group.add_argument(
-        "--max-batch-segments",
-        type=int,
-        default=8,
-        help="Maximum number of segments to process in a single batch (default: 8).",
     )
     args = parser.parse_args()
 
@@ -458,18 +406,18 @@ def main() -> None:
             codec_deterministic_decode=bool(args.codec_deterministic_decode),
             compile_model=bool(args.compile_model),
             compile_dynamic=bool(args.compile_dynamic),
-            enable_watermark=bool(args.enable_watermark),
         )
     )
     if runtime.model_cfg.use_speaker_condition_resolved and not (
         args.no_ref
         or args.ref_wav is not None
+        or args.ref_wavs is not None
         or args.ref_latent is not None
+        or args.ref_latents is not None
         or args.ref_embed is not None
     ):
         parser.error(
-            "speaker-conditioned checkpoints require one of --ref-wav, --ref-latent, "
-            "--ref-embed, or --no-ref."
+            "speaker-conditioned checkpoints require one reference option or --no-ref."
         )
     use_speaker_for_request = bool(
         runtime.model_cfg.use_speaker_condition_resolved and not args.no_ref
@@ -490,126 +438,62 @@ def main() -> None:
     for msg in scale_messages:
         print(msg)
 
-    if args.long_text:
-        # 長文分割読み上げモード
-        # テキストを自然な区切りで分割し、各セグメントを順次推論して結合する
-        result = runtime.synthesize_long(
-            LongTextSamplingRequest(
-                text=str(args.text),
-                caption=None if args.caption is None else str(args.caption),
-                ref_wav=args.ref_wav,
-                ref_latent=args.ref_latent,
-                ref_embed=args.ref_embed,
-                no_ref=bool(args.no_ref),
-                ref_normalize_db=args.ref_normalize_db,
-                ref_ensure_max=bool(args.ref_ensure_max),
-                num_candidates=1,
-                decode_mode=str(args.decode_mode),
-                max_ref_seconds=float(args.max_ref_seconds)
-                if args.max_ref_seconds is not None
-                else None,
-                max_text_len=None if args.max_text_len is None else int(args.max_text_len),
-                max_caption_len=None if args.max_caption_len is None else int(args.max_caption_len),
-                sampling_preset=str(args.sampling_preset),
-                num_steps=int(args.num_steps),
-                cfg_scale_text=cfg_scale_text,
-                cfg_scale_caption=cfg_scale_caption,
-                cfg_scale_speaker=cfg_scale_speaker,
-                cfg_guidance_mode=str(args.cfg_guidance_mode),
-                cfg_scale=None,
-                cfg_min_t=float(args.cfg_min_t),
-                cfg_max_t=float(args.cfg_max_t),
-                truncation_factor=None
-                if args.truncation_factor is None
-                else float(args.truncation_factor),
-                rescale_k=None if args.rescale_k is None else float(args.rescale_k),
-                rescale_sigma=None if args.rescale_sigma is None else float(args.rescale_sigma),
-                context_kv_cache=bool(args.context_kv_cache),
-                speaker_kv_scale=None
-                if args.speaker_kv_scale is None
-                else float(args.speaker_kv_scale),
-                speaker_kv_min_t=None
-                if args.speaker_kv_scale is None
-                else float(args.speaker_kv_min_t),
-                speaker_kv_max_layers=None
-                if args.speaker_kv_max_layers is None
-                else int(args.speaker_kv_max_layers),
-                speaker_uncond_mode=str(args.speaker_uncond_mode),
-                seed=None if args.seed is None else int(args.seed),
-                t_schedule_mode=str(args.t_schedule_mode),
-                sway_coeff=float(args.sway_coeff),
-                trim_tail=bool(args.trim_tail),
-                tail_window_size=int(args.tail_window_size),
-                tail_std_threshold=float(args.tail_std_threshold),
-                tail_mean_threshold=float(args.tail_mean_threshold),
-                lora_adapter=None if args.lora_adapter is None else str(args.lora_adapter),
-                max_segment_seconds=float(args.max_segment_seconds),
-                max_segment_chars=int(args.max_segment_chars),
-                chars_per_second=float(args.chars_per_second),
-                min_segment_chars=int(args.min_segment_chars),
-                segment_gap_seconds=float(args.segment_gap),
-                segment_trim_silence_db=float(args.segment_trim_silence_db),
-                duration_scale=float(args.duration_scale),
-                max_batch_segments=int(args.max_batch_segments),
-            ),
-            log_fn=lambda msg: print(msg, flush=True),
-        )
-    else:
-        result = runtime.synthesize(
-            SamplingRequest(
-                text=str(args.text),
-                caption=None if args.caption is None else str(args.caption),
-                ref_wav=args.ref_wav,
-                ref_latent=args.ref_latent,
-                ref_embed=args.ref_embed,
-                no_ref=bool(args.no_ref),
-                ref_normalize_db=args.ref_normalize_db,
-                ref_ensure_max=bool(args.ref_ensure_max),
-                num_candidates=int(args.num_candidates),
-                decode_mode=str(args.decode_mode),
-                seconds=None if args.seconds is None else float(args.seconds),
-                duration_scale=float(args.duration_scale),
-                max_ref_seconds=float(args.max_ref_seconds)
-                if args.max_ref_seconds is not None
-                else None,
-                max_text_len=None if args.max_text_len is None else int(args.max_text_len),
-                max_caption_len=None if args.max_caption_len is None else int(args.max_caption_len),
-                sampling_preset=str(args.sampling_preset),
-                num_steps=int(args.num_steps),
-                cfg_scale_text=cfg_scale_text,
-                cfg_scale_caption=cfg_scale_caption,
-                cfg_scale_speaker=cfg_scale_speaker,
-                cfg_guidance_mode=str(args.cfg_guidance_mode),
-                cfg_scale=None,
-                cfg_min_t=float(args.cfg_min_t),
-                cfg_max_t=float(args.cfg_max_t),
-                truncation_factor=None
-                if args.truncation_factor is None
-                else float(args.truncation_factor),
-                rescale_k=None if args.rescale_k is None else float(args.rescale_k),
-                rescale_sigma=None if args.rescale_sigma is None else float(args.rescale_sigma),
-                context_kv_cache=bool(args.context_kv_cache),
-                speaker_kv_scale=None
-                if args.speaker_kv_scale is None
-                else float(args.speaker_kv_scale),
-                speaker_kv_min_t=None
-                if args.speaker_kv_scale is None
-                else float(args.speaker_kv_min_t),
-                speaker_kv_max_layers=None
-                if args.speaker_kv_max_layers is None
-                else int(args.speaker_kv_max_layers),
-                speaker_uncond_mode=str(args.speaker_uncond_mode),
-                seed=None if args.seed is None else int(args.seed),
-                t_schedule_mode=str(args.t_schedule_mode),
-                sway_coeff=float(args.sway_coeff),
-                trim_tail=bool(args.trim_tail),
-                tail_window_size=int(args.tail_window_size),
-                tail_std_threshold=float(args.tail_std_threshold),
-                tail_mean_threshold=float(args.tail_mean_threshold),
-                lora_adapter=None if args.lora_adapter is None else str(args.lora_adapter),
-            ),
-            log_fn=None,
-        )
+    result = runtime.synthesize(
+        SamplingRequest(
+            text=str(args.text),
+            caption=None if args.caption is None else str(args.caption),
+            ref_wav=args.ref_wav,
+            ref_wavs=args.ref_wavs,
+            ref_latent=args.ref_latent,
+            ref_latents=args.ref_latents,
+            ref_embed=args.ref_embed,
+            no_ref=bool(args.no_ref),
+            ref_normalize_db=args.ref_normalize_db,
+            ref_ensure_max=bool(args.ref_ensure_max),
+            num_candidates=int(args.num_candidates),
+            decode_mode=str(args.decode_mode),
+            seconds=None if args.seconds is None else float(args.seconds),
+            duration_scale=float(args.duration_scale),
+            max_ref_seconds=float(args.max_ref_seconds)
+            if args.max_ref_seconds is not None
+            else None,
+            max_text_len=None if args.max_text_len is None else int(args.max_text_len),
+            max_caption_len=None if args.max_caption_len is None else int(args.max_caption_len),
+            num_steps=int(args.num_steps),
+            cfg_scale_text=cfg_scale_text,
+            cfg_scale_caption=cfg_scale_caption,
+            cfg_scale_speaker=cfg_scale_speaker,
+            cfg_guidance_mode=str(args.cfg_guidance_mode),
+            cfg_scale=None,
+            cfg_min_t=float(args.cfg_min_t),
+            cfg_max_t=float(args.cfg_max_t),
+            truncation_factor=None
+            if args.truncation_factor is None
+            else float(args.truncation_factor),
+            rescale_k=None if args.rescale_k is None else float(args.rescale_k),
+            rescale_sigma=None if args.rescale_sigma is None else float(args.rescale_sigma),
+            context_kv_cache=bool(args.context_kv_cache),
+            speaker_kv_scale=None
+            if args.speaker_kv_scale is None
+            else float(args.speaker_kv_scale),
+            speaker_kv_min_t=None
+            if args.speaker_kv_scale is None
+            else float(args.speaker_kv_min_t),
+            speaker_kv_max_layers=None
+            if args.speaker_kv_max_layers is None
+            else int(args.speaker_kv_max_layers),
+            speaker_uncond_mode=str(args.speaker_uncond_mode),
+            seed=None if args.seed is None else int(args.seed),
+            t_schedule_mode=str(args.t_schedule_mode),
+            sway_coeff=float(args.sway_coeff),
+            trim_tail=bool(args.trim_tail),
+            tail_window_size=int(args.tail_window_size),
+            tail_std_threshold=float(args.tail_std_threshold),
+            tail_mean_threshold=float(args.tail_mean_threshold),
+            lora_adapter=None if args.lora_adapter is None else str(args.lora_adapter),
+        ),
+        log_fn=None,
+    )
 
     print(f"[seed] used_seed: {result.used_seed}")
     if int(args.num_candidates) == 1:
