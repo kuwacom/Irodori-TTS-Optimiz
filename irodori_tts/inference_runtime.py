@@ -963,7 +963,11 @@ class InferenceRuntime:
             return cached
         if self.model.caption_encoder is None or self.model.caption_norm is None:
             raise RuntimeError("Caption conditioning is enabled but caption modules are missing.")
-        caption_state = self.model.caption_encoder(caption_ids, caption_mask)
+        # pretrained text backbone 使用時は第1引数にバックボーンを渡す
+        if self.model.pretrained_text_backbone is not None:
+            caption_state = self.model.caption_encoder(self.model.pretrained_text_backbone, caption_ids, caption_mask)
+        else:
+            caption_state = self.model.caption_encoder(caption_ids, caption_mask)
         caption_state = self.model.caption_norm(caption_state)
         encoded = EncodedCaptionCondition(state=caption_state, mask=caption_mask)
         with self._condition_cache_lock:
@@ -2110,7 +2114,11 @@ class InferenceRuntime:
 
         # 条件エンコード (テキストのみバッチごとに異なる; speaker/captionは事前計算済み)
         t0 = _measure_start(self.model_device, skip_timing_sync=self._skip_timing_sync)
-        text_state = self.model.text_encoder(text_ids, text_mask)
+        # pretrained text backbone 使用時は第1引数にバックボーンを渡す
+        if self.model.pretrained_text_backbone is not None:
+            text_state = self.model.text_encoder(self.model.pretrained_text_backbone, text_ids, text_mask)
+        else:
+            text_state = self.model.text_encoder(text_ids, text_mask)
         text_state = self.model.text_norm(text_state)
         encoded_conditions = (
             text_state, text_mask,
