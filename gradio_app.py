@@ -10,6 +10,8 @@ import gradio as gr
 from irodori_tts.gradio_emoji_palette import EMOJI_PALETTE_CSS, build_emoji_palette
 from irodori_tts.inference_runtime import (
     RuntimeKey,
+    LongTextSamplingRequest,
+    LongTextSamplingResult,
     SamplingRequest,
     clear_cached_runtime,
     default_runtime_device,
@@ -20,6 +22,7 @@ from irodori_tts.inference_runtime import (
     save_wav,
 )
 from irodori_tts.speaker_inversion import is_speaker_inversion_safetensors_path
+from irodori_tts.long_text_splitter import split_long_text
 
 MAX_GRADIO_CANDIDATES = 32
 GRADIO_AUDIO_COLS_PER_ROW = 8
@@ -169,6 +172,7 @@ def _build_runtime_key(
     model_precision: str,
     codec_device: str,
     codec_precision: str,
+    enable_watermark: bool = False,
 ) -> RuntimeKey:
     checkpoint_path = _resolve_checkpoint_path(checkpoint)
     return RuntimeKey(
@@ -178,6 +182,7 @@ def _build_runtime_key(
         model_precision=str(model_precision),
         codec_device=str(codec_device),
         codec_precision=str(codec_precision),
+        enable_watermark=bool(enable_watermark),
         compile_model=False,
         compile_dynamic=False,
     )
@@ -243,6 +248,9 @@ def _run_generation(
     speaker_kv_min_t_raw: str,
     speaker_kv_max_layers_raw: str,
     lora_adapter_raw: str,
+    enable_watermark: bool = False,
+    max_parallelism: int = 1,
+    sampling_preset: str = "custom",
 ) -> tuple[object, ...]:
     def stdout_log(msg: str) -> None:
         print(msg, flush=True)
@@ -253,6 +261,7 @@ def _run_generation(
         model_precision=model_precision,
         codec_device=codec_device,
         codec_precision=codec_precision,
+        enable_watermark=enable_watermark,
     )
 
     if str(text).strip() == "":
@@ -285,7 +294,7 @@ def _run_generation(
     ref_normalize_db = -16.0
     ref_ensure_max = True
 
-    runtime, reloaded = get_cached_runtime(runtime_key)
+    runtime, reloaded = get_cached_runtime(runtime_key, max_parallelism=int(max_parallelism))
     stdout_log(f"[gradio] runtime: {'reloaded' if reloaded else 'reused'}")
     stdout_log(
         (
@@ -328,6 +337,7 @@ def _run_generation(
             duration_scale=float(duration_scale),
             max_ref_seconds=None,
             max_text_len=None,
+            sampling_preset=str(sampling_preset),
             num_steps=int(num_steps),
             seed=None if seed is None else int(seed),
             cfg_guidance_mode=str(cfg_guidance_mode),
@@ -389,6 +399,347 @@ def _clear_runtime_cache() -> str:
     return "cleared loaded model from memory"
 
 
+def _run_long_generation(
+    text,
+    caption,
+    ref_wavs,
+    ref_embed,
+    no_ref,
+    sampling_preset,
+    num_steps,
+    cfg_scale_text,
+    cfg_scale_caption,
+    cfg_scale_speaker,
+    cfg_guidance_mode,
+    cfg_min_t,
+    cfg_max_t,
+    max_ref_seconds,
+    max_segment_seconds,
+    max_segment_chars,
+    chars_per_second,
+    min_segment_chars,
+    segment_gap,
+    segment_trim_silence_db,
+    max_batch_segments,
+    checkpoint,
+    hf_checkpoint,
+    lora_adapter,
+    model_device,
+    model_precision,
+    codec_device,
+    codec_precision,
+    codec_deterministic_encode,
+    codec_deterministic_decode,
+    compile_model,
+    compile_dynamic,
+    enable_watermark,
+    max_parallelism,
+) -> tuple[object, ...]:
+    """長文分割読み上げモード
+
+    テキストをセグメントに分割し、バッチ推論で生成したのち結合して返す。
+    LongTextSamplingRequest は参照音声1件 (ref_wav) のみ対応するため、
+    複数アップロード時は先頭1件を使用する
+    """
+    def stdout_log(msg: str) -> None:
+        print(msg, flush=True)
+
+    if str(text).strip() == "":
+        raise ValueError("text is required.")
+
+    # checkpoint 解決: hf_checkpoint が指定されていればそちらを優先
+    hf_src = str(hf_checkpoint).strip()
+    source = hf_src if hf_src else str(checkpoint).strip()
+    checkpoint_path = _resolve_checkpoint_path(source)
+
+    runtime_key = RuntimeKey(
+        checkpoint=checkpoint_path,
+        model_device=str(model_device),
+        codec_repo="Aratako/Semantic-DACVAE-Japanese-32dim",
+        model_precision=str(model_precision),
+        codec_device=str(codec_device),
+        codec_precision=str(codec_precision),
+        codec_deterministic_encode=bool(codec_deterministic_encode),
+        codec_deterministic_decode=bool(codec_deterministic_decode),
+        enable_watermark=bool(enable_watermark),
+        compile_model=bool(compile_model),
+        compile_dynamic=bool(compile_dynamic),
+    )
+
+    # LongTextSamplingRequest は ref_wav (単体) のみサポートするため先頭1件を使用
+    ref_wav = ref_wavs[0] if ref_wavs else None
+    if len(ref_wavs) > 1:
+        stdout_log(
+            f"[gradio][long] {len(ref_wavs)} reference clips uploaded; "
+            "long-text mode uses only the first clip."
+        )
+
+    runtime, reloaded = get_cached_runtime(runtime_key, max_parallelism=int(max_parallelism))
+    stdout_log(f"[gradio][long] runtime: {'reloaded' if reloaded else 'reused'}")
+    stdout_log(
+        (
+            "[gradio][long] request: model_device={} model_precision={} codec_device={} "
+            "codec_precision={} steps={} preset={} no_ref={} max_segment_seconds={} "
+            "max_segment_chars={} chars_per_second={} min_segment_chars={} segment_gap={} "
+            "trim_db={} max_batch_segments={} parallelism={}"
+        ).format(
+            model_device,
+            model_precision,
+            codec_device,
+            codec_precision,
+            num_steps,
+            sampling_preset,
+            no_ref,
+            max_segment_seconds,
+            max_segment_chars,
+            chars_per_second,
+            min_segment_chars,
+            segment_gap,
+            segment_trim_silence_db,
+            max_batch_segments,
+            max_parallelism,
+        )
+    )
+
+    # 分割プレビュー (ロギング用)。synthesize_long 内部でも分割されるが、
+    # 事前にセグメント数を把握してログに出す
+    preview = split_long_text(
+        str(text),
+        max_seconds=float(max_segment_seconds),
+        max_chars=int(max_segment_chars),
+        chars_per_second=float(chars_per_second),
+        min_segment_chars=int(min_segment_chars),
+        duration_scale=1.0,
+    )
+    stdout_log(
+        f"[gradio][long] preview: {len(preview.segments)} segments "
+        f"(wasSplit={preview.wasSplit})"
+    )
+
+    req = LongTextSamplingRequest(
+        text=str(text),
+        caption=caption,
+        ref_wav=ref_wav,
+        ref_latent=None,
+        ref_embed=ref_embed,
+        no_ref=bool(no_ref),
+        ref_normalize_db=-16.0,
+        ref_ensure_max=True,
+        num_candidates=1,
+        decode_mode="sequential",
+        max_ref_seconds=max_ref_seconds,
+        max_text_len=None,
+        max_caption_len=None,
+        sampling_preset=str(sampling_preset),
+        num_steps=int(num_steps),
+        cfg_scale_text=float(cfg_scale_text),
+        cfg_scale_caption=float(cfg_scale_caption),
+        cfg_scale_speaker=float(cfg_scale_speaker),
+        cfg_guidance_mode=str(cfg_guidance_mode),
+        cfg_scale=None,
+        cfg_min_t=float(cfg_min_t),
+        cfg_max_t=float(cfg_max_t),
+        truncation_factor=None,
+        rescale_k=None,
+        rescale_sigma=None,
+        context_kv_cache=True,
+        speaker_kv_scale=None,
+        speaker_kv_min_t=None,
+        speaker_kv_max_layers=None,
+        seed=None,
+        t_schedule_mode="linear",
+        sway_coeff=-1.0,
+        trim_tail=True,
+        lora_adapter=lora_adapter,
+        max_segment_seconds=float(max_segment_seconds),
+        max_segment_chars=int(max_segment_chars),
+        chars_per_second=float(chars_per_second),
+        min_segment_chars=int(min_segment_chars),
+        duration_scale=1.0,
+        segment_trim_silence_db=float(segment_trim_silence_db),
+        segment_gap_seconds=float(segment_gap),
+        max_batch_segments=int(max_batch_segments),
+    )
+
+    result: LongTextSamplingResult = runtime.synthesize_long(req, log_fn=stdout_log)
+
+    out_dir = Path("gradio_outputs")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    out_paths: list[str] = []
+
+    # 結合済み全体音声を保存
+    main_path = out_dir / f"long_{stamp}_combined.wav"
+    save_wav(main_path, result.audio.float(), result.sample_rate)
+    out_paths.append(str(main_path))
+
+    # セグメントごとの音声も保存 (デバッグ/比較用)
+    for i, seg_audio in enumerate(result.segment_audios, start=1):
+        seg_path = out_dir / f"long_{stamp}_seg{i:03d}.wav"
+        save_wav(seg_path, seg_audio.float(), result.sample_rate)
+        out_paths.append(str(seg_path))
+
+    runtime_msg = "runtime: reloaded" if reloaded else "runtime: reused"
+    detail_lines = [
+        runtime_msg,
+        f"seed_used: {result.used_seed}",
+        f"segments: {len(result.segments)}",
+        f"saved: {len(out_paths)} files (1 combined + {len(result.segment_audios)} segment clips)",
+        *[f"saved[{i}]: {path}" for i, path in enumerate(out_paths, start=1)],
+        *result.messages,
+    ]
+    detail_text = "\n".join(detail_lines)
+    timing_text = _format_timings(result.stage_timings, result.total_to_decode)
+    stdout_log(
+        f"[gradio][long] saved {len(out_paths)} files ({len(result.segments)} segments)"
+    )
+
+    audio_updates: list[object] = []
+    for i in range(MAX_GRADIO_CANDIDATES):
+        if i < len(out_paths):
+            audio_updates.append(gr.update(value=out_paths[i], visible=True))
+        else:
+            audio_updates.append(gr.update(value=None, visible=False))
+    return (*audio_updates, detail_text, timing_text)
+
+
+def _dispatch_generation(
+    long_text_mode,
+    checkpoint,
+    model_device,
+    model_precision,
+    codec_device,
+    codec_precision,
+    text,
+    uploaded_audio,
+    uploaded_speaker_embedding,
+    speaker_embedding_path_raw,
+    num_steps,
+    num_candidates,
+    seed_raw,
+    seconds_raw,
+    duration_scale,
+    t_schedule_mode,
+    sway_coeff,
+    cfg_guidance_mode,
+    cfg_scale_text,
+    cfg_scale_speaker,
+    cfg_scale_raw,
+    cfg_min_t,
+    cfg_max_t,
+    context_kv_cache,
+    truncation_factor_raw,
+    rescale_k_raw,
+    rescale_sigma_raw,
+    speaker_kv_scale_raw,
+    speaker_kv_min_t_raw,
+    speaker_kv_max_layers_raw,
+    lora_adapter_raw,
+    enable_watermark,
+    max_parallelism,
+    sampling_preset,
+    caption,
+    cfg_scale_caption,
+    max_segment_seconds,
+    max_segment_chars,
+    chars_per_second,
+    min_segment_chars,
+    segment_gap,
+    segment_trim_silence_db,
+    max_batch_segments,
+):
+    """Generate ボタンのディスパッチャ
+
+    long_text_mode が有効なら長文分割読み上げ (_run_long_generation) へ、
+    それ以外は通常生成 (_run_generation) へ振り分ける。長文モードは
+    参照音声/埋め込みの解決をここで行う
+    """
+    if not bool(long_text_mode):
+        return _run_generation(
+            checkpoint,
+            model_device,
+            model_precision,
+            codec_device,
+            codec_precision,
+            text,
+            uploaded_audio,
+            uploaded_speaker_embedding,
+            speaker_embedding_path_raw,
+            num_steps,
+            num_candidates,
+            seed_raw,
+            seconds_raw,
+            duration_scale,
+            t_schedule_mode,
+            sway_coeff,
+            cfg_guidance_mode,
+            cfg_scale_text,
+            cfg_scale_speaker,
+            cfg_scale_raw,
+            cfg_min_t,
+            cfg_max_t,
+            context_kv_cache,
+            truncation_factor_raw,
+            rescale_k_raw,
+            rescale_sigma_raw,
+            speaker_kv_scale_raw,
+            speaker_kv_min_t_raw,
+            speaker_kv_max_layers_raw,
+            lora_adapter_raw,
+            enable_watermark,
+            max_parallelism,
+            sampling_preset,
+        )
+
+    # 長文分割モード: 参照音声/埋め込みを解決して _run_long_generation へ
+    ref_wavs = _resolve_ref_wavs(uploaded_audio)
+    ref_embed = _resolve_speaker_embedding(
+        uploaded_embedding=uploaded_speaker_embedding,
+        speaker_embedding_path_raw=speaker_embedding_path_raw,
+    )
+    if ref_wavs and ref_embed is not None:
+        raise ValueError("Reference audio and speaker embedding are mutually exclusive.")
+    no_ref = not ref_wavs and ref_embed is None
+    lora_adapter = _parse_optional_str(lora_adapter_raw)
+    caption_text = _parse_optional_str(caption)
+    return _run_long_generation(
+        text,
+        caption_text,
+        ref_wavs,
+        ref_embed,
+        no_ref,
+        sampling_preset,
+        num_steps,
+        cfg_scale_text,
+        cfg_scale_caption,
+        cfg_scale_speaker,
+        cfg_guidance_mode,
+        cfg_min_t,
+        cfg_max_t,
+        None,
+        max_segment_seconds,
+        max_segment_chars,
+        chars_per_second,
+        min_segment_chars,
+        segment_gap,
+        segment_trim_silence_db,
+        max_batch_segments,
+        checkpoint,
+        "",
+        lora_adapter,
+        model_device,
+        model_precision,
+        codec_device,
+        codec_precision,
+        True,
+        True,
+        False,
+        False,
+        enable_watermark,
+        max_parallelism,
+    )
+
+
 def build_ui() -> gr.Blocks:
     default_checkpoint = _default_checkpoint()
     default_model_device = _default_model_device()
@@ -440,6 +791,16 @@ def build_ui() -> gr.Blocks:
             clear_cache_btn = gr.Button("Unload Model")
             clear_cache_msg = gr.Textbox(label="Model Status", interactive=False)
 
+        with gr.Row():
+            max_parallelism = gr.Slider(
+                label="Max Parallelism",
+                minimum=1,
+                maximum=8,
+                step=1,
+                value=1,
+            )
+            enable_watermark = gr.Checkbox(label="Enable Watermark", value=False)
+
         with gr.Column():
             text = gr.Textbox(
                 label="Text",
@@ -477,6 +838,12 @@ def build_ui() -> gr.Blocks:
                     )
 
         with gr.Accordion("Sampling", open=True):
+            with gr.Row():
+                sampling_preset = gr.Dropdown(
+                    label="Sampling Preset",
+                    choices=["quality", "balanced", "speed", "extreme", "custom"],
+                    value="custom",
+                )
             with gr.Row():
                 num_steps = gr.Slider(label="Num Steps", minimum=1, maximum=120, value=40, step=1)
                 num_candidates = gr.Slider(
@@ -550,6 +917,29 @@ def build_ui() -> gr.Blocks:
                 )
             lora_adapter_raw = gr.Textbox(label="LoRA Adapter Directory (optional)", value="")
 
+        with gr.Accordion("Long Text Mode (split & batch generation)", open=False):
+            long_text_mode = gr.Checkbox(label="Enable Long Text Mode", value=False)
+            with gr.Column(visible=False) as long_text_col:
+                with gr.Row():
+                    caption = gr.Textbox(label="Caption / Style (optional)", value="", scale=2)
+                    cfg_scale_caption = gr.Slider(
+                        label="CFG Scale Caption",
+                        minimum=0.0,
+                        maximum=10.0,
+                        value=3.0,
+                        step=0.1,
+                        scale=1,
+                    )
+                with gr.Row():
+                    max_segment_seconds = gr.Slider(label="Max Segment Seconds", minimum=5.0, maximum=30.0, value=30.0, step=1.0)
+                    max_segment_chars = gr.Slider(label="Max Segment Chars", minimum=20, maximum=300, value=180, step=10)
+                    chars_per_second = gr.Slider(label="Chars Per Second", minimum=4.0, maximum=20.0, value=10.0, step=0.5)
+                with gr.Row():
+                    min_segment_chars = gr.Slider(label="Min Segment Chars", minimum=1, maximum=50, value=4, step=1)
+                    segment_gap = gr.Slider(label="Segment Gap (s)", minimum=0.0, maximum=2.0, value=0.2, step=0.05)
+                    segment_trim_silence_db = gr.Slider(label="Segment Trim Silence (dB)", minimum=-80.0, maximum=-10.0, value=-40.0, step=5.0)
+                    max_batch_segments = gr.Slider(label="Max Batch Segments", minimum=1, maximum=16, value=8, step=1)
+
         generate_btn = gr.Button("Generate", variant="primary")
 
         out_audios: list[gr.Audio] = []
@@ -576,8 +966,9 @@ def build_ui() -> gr.Blocks:
         out_timing = gr.Textbox(label="Timing", lines=8)
 
         generate_btn.click(
-            _run_generation,
+            _dispatch_generation,
             inputs=[
+                long_text_mode,
                 checkpoint,
                 model_device,
                 model_precision,
@@ -608,8 +999,25 @@ def build_ui() -> gr.Blocks:
                 speaker_kv_min_t_raw,
                 speaker_kv_max_layers_raw,
                 lora_adapter_raw,
+                enable_watermark,
+                max_parallelism,
+                sampling_preset,
+                caption,
+                cfg_scale_caption,
+                max_segment_seconds,
+                max_segment_chars,
+                chars_per_second,
+                min_segment_chars,
+                segment_gap,
+                segment_trim_silence_db,
+                max_batch_segments,
             ],
             outputs=[*out_audios, out_log, out_timing],
+        )
+        long_text_mode.change(
+            fn=lambda v: gr.update(visible=bool(v)),
+            inputs=[long_text_mode],
+            outputs=[long_text_col],
         )
         model_device.change(
             _on_model_device_change, inputs=[model_device], outputs=[model_precision]
