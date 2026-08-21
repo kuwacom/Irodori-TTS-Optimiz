@@ -1582,6 +1582,17 @@ class TextToLatentRFDiT(nn.Module):
         if self.pretrained_text_backbone is not None:
             self.pretrained_text_backbone.set_gradient_checkpointing(enabled)
 
+    def prewarm_rope_cache(self, max_seq_len: int = 4096) -> None:
+        """推論前に全 RoPE キャッシュを最大長で事前確保。並列推論時の上書き競合を防ぐ"""
+        device = self.device
+        self._rope_freqs(max_seq_len, device)
+        if hasattr(self.text_encoder, "_rope_freqs"):
+            self.text_encoder._rope_freqs(max_seq_len, device)
+        if self.caption_encoder is not None and hasattr(self.caption_encoder, "_rope_freqs"):
+            self.caption_encoder._rope_freqs(max_seq_len, device)
+        if self.speaker_encoder is not None:
+            self.speaker_encoder._rope_freqs(max_seq_len, device)
+
     def enable_speaker_inversion(
         self,
         *,
