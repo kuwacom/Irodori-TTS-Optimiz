@@ -665,9 +665,39 @@ def _resolve_tokenizer_source(checkpoint_path: Path, fallback_repo: str) -> tupl
         checkpoint_path.parent.parent / "tokenizer",
     )
     for bundled in bundled_candidates:
-       if (bundled / "tokenizer_config.json").is_file():
-           return str(bundled), True
+        if (bundled / "tokenizer_config.json").is_file():
+            return str(bundled), True
     return fallback_repo, False
+
+
+def _remove_weight_norm_from_codec(model: torch.nn.Module) -> None:
+    """codec (DACVAE) の weight_norm を焼き込んで通常の weight パラメータに変換する
+
+    weight_norm は forward 時に weight_g * weight_v / ||weight_v|| を毎回計算するため
+    スレッドセーフではない。remove で固定パラメータに変換することで並列推論が可能になる
+    """
+    # torch.nn.utils.weight_norm と torch.nn.utils.parametrizations.weight_norm の両方に対応
+    try:
+        # 新しい parametrization API (torch >= 2.1)
+        from torch.nn.utils.parametrize import remove_parametrizations
+        for name, module in model.named_modules():
+            if hasattr(module, "parametrizations"):
+                for param_name in list(getattr(module.parametrizations, "_modules", {}).keys()):
+                    try:
+                        remove_parametrizations(module, param_name)
+                    except Exception:
+                        pass
+    except ImportError:
+        pass
+    # 古い weight_norm API (hook ベース)
+    for name, module in model.named_modules():
+        if hasattr(module, "weight_g") or hasattr(module, "weight_v"):
+            try:
+                torch.nn.utils.weight_norm.remove(module, name="weight")
+            except Exception:
+                pass
+    # eval モードにして BF16 で再評価し、weight を固定
+    model.eval()
 
 
 class _InferenceScope:
@@ -763,8 +793,6 @@ class InferenceRuntime:
         # LoRA アダプタ切り替えは排他制御が必要なため Lock を維持
         # WARNING: LoRA 使用時の並列安全性は完全ではない
         self._lora_lock = threading.Lock()
-        # codec (DACVAE) の encode/decode はスレッドセーフではないため排他制御
-        self._codec_lock = threading.Lock()
         self._condition_cache_lock = threading.Lock()
         self._speaker_condition_cache: OrderedDict[str, EncodedSpeakerCondition] = OrderedDict()
         self._caption_condition_cache: OrderedDict[str, EncodedCaptionCondition] = OrderedDict()
@@ -1165,6 +1193,10 @@ class InferenceRuntime:
             deterministic_encode=bool(key.codec_deterministic_encode),
             deterministic_decode=bool(key.codec_deterministic_decode),
         )
+        # 推論時に weight_norm を焼き込んで並列安全にする
+        # DACVAE の weight_norm は forward 時に weight_g * weight_v / ||weight_v|| を
+        # 毎回計算するため、スレッドセーフでない。remove で固定パラメータに変換する
+        _remove_weight_norm_from_codec(codec.model)
         if model_cfg.latent_dim != codec.latent_dim:
             raise ValueError(
                 f"Latent dimension mismatch: checkpoint latent_dim={model_cfg.latent_dim} but codec latent_dim={codec.latent_dim}. "
@@ -1393,8 +1425,7 @@ class InferenceRuntime:
                     piece = self._load_cached_reference_latent(cache_path, messages)
                 if piece is None:
                     # codec (DACVAE) はスレッドセーフではないため排他制御
-                    with self._codec_lock:
-                        piece = self.codec.encode_waveform(
+                    piece = self.codec.encode_waveform(
                             wav.unsqueeze(0),
                             sample_rate=int(sr),
                             normalize_db=req.ref_normalize_db,
@@ -1852,8 +1883,7 @@ class InferenceRuntime:
             trimmed_audios: list[torch.Tensor] = []
             if decode_mode == "batch":
                 # codec (DACVAE) はスレッドセーフではないため排他制御
-                with self._codec_lock:
-                    audio_batch = self.codec.decode_latent(z).cpu()
+                audio_batch = self.codec.decode_latent(z).cpu()
                 for i in range(num_candidates):
                     audio_i = audio_batch[i]
                     max_samples = target_samples
@@ -1873,8 +1903,7 @@ class InferenceRuntime:
             else:
                 for i in range(num_candidates):
                     # codec (DACVAE) はスレッドセーフではないため排他制御
-                    with self._codec_lock:
-                        audio_i = self.codec.decode_latent(z[i : i + 1]).cpu()[0]
+                    audio_i = self.codec.decode_latent(z[i : i + 1]).cpu()[0]
                     max_samples = target_samples
                     if bool(req.trim_tail):
                         flattening_point = find_flattening_point(
@@ -2200,8 +2229,7 @@ class InferenceRuntime:
             z_padded[i, : latent_steps_list[i], :] = z_segments[i][0]
 
         # codec (DACVAE) はスレッドセーフではないため排他制御
-        with self._codec_lock:
-            audio_batch = self.codec.decode_latent(z_padded).cpu()
+        audio_batch = self.codec.decode_latent(z_padded).cpu()
 
         trimmed_audios: list[torch.Tensor] = []
         for i in range(num_segments):

@@ -157,6 +157,14 @@ uv sync --extra legacy-cuda
 この extra は PyTorch / Torchaudio を `2.5.1` + `cu118` 系に固定します。  
 詳細は下記 [Installation](#installation) セクションを参照してください。
 
+### Codec weight_norm 焼き込み
+
+DACVAE codec は内部で `weight_norm` を使用しており、forward 時に毎回無駄に `weight_g * weight_v / ||weight_v||` を計算しています。  
+この計算はスレッドセーフではないため、並列推論時に複数スレッドが同時に codec の encode/decode を呼ぶと `CUDA error: misaligned address` が発生します。
+
+このフォークでは `InferenceRuntime.from_key()` で codec を構築した直後に `remove_weight_norm` を呼び出し、weight を固定パラメータに焼き込みます。  
+これにより forward パスがステートレスになり、メインモデルと同じく VRAM 上の共通読み出しで並列実行が可能になります。
+
 ### 並列推論 (Parallel Inference)
 
 1つのモデル重みを VRAM に載せたまま、複数リクエストを同時に推論可能にする機能です。  
