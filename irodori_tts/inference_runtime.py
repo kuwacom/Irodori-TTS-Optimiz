@@ -763,6 +763,8 @@ class InferenceRuntime:
         # LoRA アダプタ切り替えは排他制御が必要なため Lock を維持
         # WARNING: LoRA 使用時の並列安全性は完全ではない
         self._lora_lock = threading.Lock()
+        # codec (DACVAE) の encode/decode はスレッドセーフではないため排他制御
+        self._codec_lock = threading.Lock()
         self._condition_cache_lock = threading.Lock()
         self._speaker_condition_cache: OrderedDict[str, EncodedSpeakerCondition] = OrderedDict()
         self._caption_condition_cache: OrderedDict[str, EncodedCaptionCondition] = OrderedDict()
@@ -1390,12 +1392,14 @@ class InferenceRuntime:
                 if cache_path is not None:
                     piece = self._load_cached_reference_latent(cache_path, messages)
                 if piece is None:
-                    piece = self.codec.encode_waveform(
-                        wav.unsqueeze(0),
-                        sample_rate=int(sr),
-                        normalize_db=req.ref_normalize_db,
-                        ensure_max=bool(req.ref_ensure_max),
-                    ).cpu()
+                    # codec (DACVAE) はスレッドセーフではないため排他制御
+                    with self._codec_lock:
+                        piece = self.codec.encode_waveform(
+                            wav.unsqueeze(0),
+                            sample_rate=int(sr),
+                            normalize_db=req.ref_normalize_db,
+                            ensure_max=bool(req.ref_ensure_max),
+                        ).cpu()
                     if cache_path is not None:
                         self._save_cached_reference_latent(
                             cache_path=cache_path, ref_latent=piece, messages=messages,
@@ -1847,7 +1851,9 @@ class InferenceRuntime:
             t0 = _measure_start(self.model_device, self.codec_device, skip_timing_sync=self._skip_timing_sync)
             trimmed_audios: list[torch.Tensor] = []
             if decode_mode == "batch":
-                audio_batch = self.codec.decode_latent(z).cpu()
+                # codec (DACVAE) はスレッドセーフではないため排他制御
+                with self._codec_lock:
+                    audio_batch = self.codec.decode_latent(z).cpu()
                 for i in range(num_candidates):
                     audio_i = audio_batch[i]
                     max_samples = target_samples
@@ -1866,7 +1872,9 @@ class InferenceRuntime:
                     trimmed_audios.append(audio_i[:, :max_samples])
             else:
                 for i in range(num_candidates):
-                    audio_i = self.codec.decode_latent(z[i : i + 1]).cpu()[0]
+                    # codec (DACVAE) はスレッドセーフではないため排他制御
+                    with self._codec_lock:
+                        audio_i = self.codec.decode_latent(z[i : i + 1]).cpu()[0]
                     max_samples = target_samples
                     if bool(req.trim_tail):
                         flattening_point = find_flattening_point(
@@ -2191,7 +2199,9 @@ class InferenceRuntime:
         for i in range(num_segments):
             z_padded[i, : latent_steps_list[i], :] = z_segments[i][0]
 
-        audio_batch = self.codec.decode_latent(z_padded).cpu()
+        # codec (DACVAE) はスレッドセーフではないため排他制御
+        with self._codec_lock:
+            audio_batch = self.codec.decode_latent(z_padded).cpu()
 
         trimmed_audios: list[torch.Tensor] = []
         for i in range(num_segments):
