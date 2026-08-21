@@ -7,6 +7,7 @@ from pathlib import Path
 
 from irodori_tts.inference_runtime import (
     InferenceRuntime,
+    LongTextSamplingRequest,
     RuntimeKey,
     SamplingRequest,
     default_runtime_device,
@@ -172,6 +173,15 @@ def main() -> None:
     )
     parser.add_argument("--num-steps", type=int, default=40)
     parser.add_argument(
+        "--sampling-preset",
+        choices=["quality", "balanced", "speed", "extreme", "custom"],
+        default="custom",
+        help=(
+            "Sampling speed/quality preset. "
+            "quality/custom keep explicit arguments; balanced/speed/extreme override steps and CFG mode/range."
+        ),
+    )
+    parser.add_argument(
         "--t-schedule-mode",
         choices=["linear", "sway"],
         default="linear",
@@ -225,6 +235,12 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Use dynamic=True for torch.compile (default: disabled).",
+    )
+    parser.add_argument(
+        "--enable-watermark",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable SilentCipher watermark on generated audio (default: disabled for speed).",
     )
     parser.add_argument("--cfg-scale-text", type=float, default=3.0)
     parser.add_argument("--cfg-scale-caption", type=float, default=3.0)
@@ -390,6 +406,47 @@ def main() -> None:
             "text+caption-only inference even when the checkpoint supports speaker conditioning."
         ),
     )
+    # 長文分割読み上げオプション
+    long_text_group = parser.add_argument_group("long text splitting")
+    long_text_group.add_argument(
+        "--long-text",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable long text splitting mode. Instead of a single diffusion pass, "
+            "the input text is split at natural boundaries and each segment is "
+            "synthesized separately then concatenated. Overrides --seconds, "
+            "--duration-scale, and --num-candidates."
+        ),
+    )
+    long_text_group.add_argument(
+        "--max-segment-seconds", type=float, default=30.0,
+        help="Maximum estimated duration per segment in seconds (default: 30).",
+    )
+    long_text_group.add_argument(
+        "--max-segment-chars", type=int, default=180,
+        help="Maximum character count per segment before forced cut (default: 180).",
+    )
+    long_text_group.add_argument(
+        "--chars-per-second", type=float, default=10.0,
+        help="Estimated characters per second for duration prediction (default: 10).",
+    )
+    long_text_group.add_argument(
+        "--min-segment-chars", type=int, default=4,
+        help="Minimum characters per segment; shorter segments are merged (default: 4).",
+    )
+    long_text_group.add_argument(
+        "--segment-gap", type=float, default=0.2,
+        help="Gap duration in seconds between concatenated segments after trimming edge silence (default: 0.2).",
+    )
+    long_text_group.add_argument(
+        "--segment-trim-silence-db", type=float, default=-40.0,
+        help="Threshold in dB for trimming leading/trailing silence from each segment (-40 ≈ 1%% amplitude, default: -40.0).",
+    )
+    long_text_group.add_argument(
+        "--max-batch-segments", type=int, default=8,
+        help="Maximum number of segments to process in a single batch (default: 8).",
+    )
     args = parser.parse_args()
 
     checkpoint_path = _resolve_checkpoint_path(args)
@@ -406,6 +463,7 @@ def main() -> None:
             codec_deterministic_decode=bool(args.codec_deterministic_decode),
             compile_model=bool(args.compile_model),
             compile_dynamic=bool(args.compile_dynamic),
+            enable_watermark=bool(args.enable_watermark),
         )
     )
     if runtime.model_cfg.use_speaker_condition_resolved and not (
@@ -438,62 +496,115 @@ def main() -> None:
     for msg in scale_messages:
         print(msg)
 
-    result = runtime.synthesize(
-        SamplingRequest(
-            text=str(args.text),
-            caption=None if args.caption is None else str(args.caption),
-            ref_wav=args.ref_wav,
-            ref_wavs=args.ref_wavs,
-            ref_latent=args.ref_latent,
-            ref_latents=args.ref_latents,
-            ref_embed=args.ref_embed,
-            no_ref=bool(args.no_ref),
-            ref_normalize_db=args.ref_normalize_db,
-            ref_ensure_max=bool(args.ref_ensure_max),
-            num_candidates=int(args.num_candidates),
-            decode_mode=str(args.decode_mode),
-            seconds=None if args.seconds is None else float(args.seconds),
-            duration_scale=float(args.duration_scale),
-            max_ref_seconds=float(args.max_ref_seconds)
-            if args.max_ref_seconds is not None
-            else None,
-            max_text_len=None if args.max_text_len is None else int(args.max_text_len),
-            max_caption_len=None if args.max_caption_len is None else int(args.max_caption_len),
-            num_steps=int(args.num_steps),
-            cfg_scale_text=cfg_scale_text,
-            cfg_scale_caption=cfg_scale_caption,
-            cfg_scale_speaker=cfg_scale_speaker,
-            cfg_guidance_mode=str(args.cfg_guidance_mode),
-            cfg_scale=None,
-            cfg_min_t=float(args.cfg_min_t),
-            cfg_max_t=float(args.cfg_max_t),
-            truncation_factor=None
-            if args.truncation_factor is None
-            else float(args.truncation_factor),
-            rescale_k=None if args.rescale_k is None else float(args.rescale_k),
-            rescale_sigma=None if args.rescale_sigma is None else float(args.rescale_sigma),
-            context_kv_cache=bool(args.context_kv_cache),
-            speaker_kv_scale=None
-            if args.speaker_kv_scale is None
-            else float(args.speaker_kv_scale),
-            speaker_kv_min_t=None
-            if args.speaker_kv_scale is None
-            else float(args.speaker_kv_min_t),
-            speaker_kv_max_layers=None
-            if args.speaker_kv_max_layers is None
-            else int(args.speaker_kv_max_layers),
-            speaker_uncond_mode=str(args.speaker_uncond_mode),
-            seed=None if args.seed is None else int(args.seed),
-            t_schedule_mode=str(args.t_schedule_mode),
-            sway_coeff=float(args.sway_coeff),
-            trim_tail=bool(args.trim_tail),
-            tail_window_size=int(args.tail_window_size),
-            tail_std_threshold=float(args.tail_std_threshold),
-            tail_mean_threshold=float(args.tail_mean_threshold),
-            lora_adapter=None if args.lora_adapter is None else str(args.lora_adapter),
-        ),
-        log_fn=None,
-    )
+    if args.long_text:
+        result = runtime.synthesize_long(
+            LongTextSamplingRequest(
+                text=str(args.text),
+                caption=None if args.caption is None else str(args.caption),
+                ref_wav=args.ref_wav,
+                ref_latent=args.ref_latent,
+                ref_embed=args.ref_embed,
+                no_ref=bool(args.no_ref),
+                ref_normalize_db=args.ref_normalize_db,
+                ref_ensure_max=bool(args.ref_ensure_max),
+                decode_mode=str(args.decode_mode),
+                max_ref_seconds=float(args.max_ref_seconds) if args.max_ref_seconds is not None else None,
+                max_text_len=None if args.max_text_len is None else int(args.max_text_len),
+                max_caption_len=None if args.max_caption_len is None else int(args.max_caption_len),
+                sampling_preset=str(args.sampling_preset),
+                num_steps=int(args.num_steps),
+                cfg_scale_text=cfg_scale_text,
+                cfg_scale_caption=cfg_scale_caption,
+                cfg_scale_speaker=cfg_scale_speaker,
+                cfg_guidance_mode=str(args.cfg_guidance_mode),
+                cfg_scale=None,
+                cfg_min_t=float(args.cfg_min_t),
+                cfg_max_t=float(args.cfg_max_t),
+                truncation_factor=None if args.truncation_factor is None else float(args.truncation_factor),
+                rescale_k=None if args.rescale_k is None else float(args.rescale_k),
+                rescale_sigma=None if args.rescale_sigma is None else float(args.rescale_sigma),
+                context_kv_cache=bool(args.context_kv_cache),
+                speaker_kv_scale=None if args.speaker_kv_scale is None else float(args.speaker_kv_scale),
+                speaker_kv_min_t=None if args.speaker_kv_scale is None else float(args.speaker_kv_min_t),
+                speaker_kv_max_layers=None if args.speaker_kv_max_layers is None else int(args.speaker_kv_max_layers),
+                speaker_uncond_mode=str(args.speaker_uncond_mode),
+                seed=None if args.seed is None else int(args.seed),
+                t_schedule_mode=str(args.t_schedule_mode),
+                sway_coeff=float(args.sway_coeff),
+                trim_tail=bool(args.trim_tail),
+                tail_window_size=int(args.tail_window_size),
+                tail_std_threshold=float(args.tail_std_threshold),
+                tail_mean_threshold=float(args.tail_mean_threshold),
+                lora_adapter=None if args.lora_adapter is None else str(args.lora_adapter),
+                max_segment_seconds=float(args.max_segment_seconds),
+                max_segment_chars=int(args.max_segment_chars),
+                chars_per_second=float(args.chars_per_second),
+                min_segment_chars=int(args.min_segment_chars),
+                segment_gap_seconds=float(args.segment_gap),
+                segment_trim_silence_db=float(args.segment_trim_silence_db),
+                duration_scale=float(args.duration_scale),
+                max_batch_segments=int(args.max_batch_segments),
+            ),
+            log_fn=lambda msg: print(msg, flush=True),
+        )
+    else:
+        result = runtime.synthesize(
+            SamplingRequest(
+                text=str(args.text),
+                caption=None if args.caption is None else str(args.caption),
+                ref_wav=args.ref_wav,
+                ref_wavs=args.ref_wavs,
+                ref_latent=args.ref_latent,
+                ref_latents=args.ref_latents,
+                ref_embed=args.ref_embed,
+                no_ref=bool(args.no_ref),
+                ref_normalize_db=args.ref_normalize_db,
+                ref_ensure_max=bool(args.ref_ensure_max),
+                num_candidates=int(args.num_candidates),
+                decode_mode=str(args.decode_mode),
+                seconds=None if args.seconds is None else float(args.seconds),
+                duration_scale=float(args.duration_scale),
+                max_ref_seconds=float(args.max_ref_seconds)
+                if args.max_ref_seconds is not None
+                else None,
+                max_text_len=None if args.max_text_len is None else int(args.max_text_len),
+                max_caption_len=None if args.max_caption_len is None else int(args.max_caption_len),
+                num_steps=int(args.num_steps),
+                cfg_scale_text=cfg_scale_text,
+                cfg_scale_caption=cfg_scale_caption,
+                cfg_scale_speaker=cfg_scale_speaker,
+                cfg_guidance_mode=str(args.cfg_guidance_mode),
+                cfg_scale=None,
+                cfg_min_t=float(args.cfg_min_t),
+                cfg_max_t=float(args.cfg_max_t),
+                truncation_factor=None
+                if args.truncation_factor is None
+                else float(args.truncation_factor),
+                rescale_k=None if args.rescale_k is None else float(args.rescale_k),
+                rescale_sigma=None if args.rescale_sigma is None else float(args.rescale_sigma),
+                context_kv_cache=bool(args.context_kv_cache),
+                speaker_kv_scale=None
+                if args.speaker_kv_scale is None
+                else float(args.speaker_kv_scale),
+                speaker_kv_min_t=None
+                if args.speaker_kv_scale is None
+                else float(args.speaker_kv_min_t),
+                speaker_kv_max_layers=None
+                if args.speaker_kv_max_layers is None
+                else int(args.speaker_kv_max_layers),
+                speaker_uncond_mode=str(args.speaker_uncond_mode),
+                seed=None if args.seed is None else int(args.seed),
+                t_schedule_mode=str(args.t_schedule_mode),
+                sway_coeff=float(args.sway_coeff),
+                trim_tail=bool(args.trim_tail),
+                tail_window_size=int(args.tail_window_size),
+                tail_std_threshold=float(args.tail_std_threshold),
+                tail_mean_threshold=float(args.tail_mean_threshold),
+                lora_adapter=None if args.lora_adapter is None else str(args.lora_adapter),
+                sampling_preset=str(args.sampling_preset),
+            ),
+            log_fn=None,
+        )
 
     print(f"[seed] used_seed: {result.used_seed}")
     if int(args.num_candidates) == 1:
