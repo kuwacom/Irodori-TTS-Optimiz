@@ -497,12 +497,29 @@ def main() -> None:
         print(msg)
 
     if args.long_text:
+        # LongTextSamplingRequest は ref_wav (単体) のみサポートするため先頭1件を使用
+        long_ref_wav = args.ref_wav
+        long_ref_latent = args.ref_latent
+        if long_ref_wav is None and args.ref_wavs:
+            long_ref_wav = args.ref_wavs[0]
+            print(
+                f"[long-text] {len(args.ref_wavs)} reference clips provided; "
+                "long-text mode uses only the first clip.",
+                flush=True,
+            )
+        if long_ref_latent is None and args.ref_latents:
+            long_ref_latent = args.ref_latents[0]
+            print(
+                f"[long-text] {len(args.ref_latents)} reference latents provided; "
+                "long-text mode uses only the first clip.",
+                flush=True,
+            )
         result = runtime.synthesize_long(
-            LongTextSamplingRequest(
+           LongTextSamplingRequest(
                 text=str(args.text),
                 caption=None if args.caption is None else str(args.caption),
-                ref_wav=args.ref_wav,
-                ref_latent=args.ref_latent,
+                ref_wav=long_ref_wav,
+                ref_latent=long_ref_latent,
                 ref_embed=args.ref_embed,
                 no_ref=bool(args.no_ref),
                 ref_normalize_db=args.ref_normalize_db,
@@ -607,7 +624,7 @@ def main() -> None:
         )
 
     print(f"[seed] used_seed: {result.used_seed}")
-    if int(args.num_candidates) == 1:
+    if int(args.num_candidates) == 1 or args.long_text:
         out_path = save_wav(args.output_wav, result.audio, result.sample_rate)
         print(f"Saved: {out_path}")
     else:

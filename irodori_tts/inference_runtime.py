@@ -116,18 +116,6 @@ def _sync_device(device: torch.device, *, skip_timing_sync: bool = False) -> Non
         xpu = getattr(torch, "xpu", None)
         if xpu is not None and hasattr(xpu, "synchronize"):
             xpu.synchronize()
-    if skip_timing_sync:
-        return
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
-    elif device.type == "mps":
-        mps = getattr(torch, "mps", None)
-        if mps is not None and hasattr(mps, "synchronize"):
-            mps.synchronize()
-    elif device.type == "xpu":
-        xpu = getattr(torch, "xpu", None)
-        if xpu is not None and hasattr(xpu, "synchronize"):
-            xpu.synchronize()
 
 
 def _sync_devices(*devices: torch.device, skip_timing_sync: bool = False) -> None:
@@ -763,7 +751,6 @@ class InferenceRuntime:
             SilentCipherWatermarker(device=str(self.codec_device))
             if bool(key.enable_watermark) else None
         )
-        self._infer_lock = threading.Lock()
         self._model_dtype = next(self.model.parameters()).dtype
         self._lora_adapter_names: dict[str, str] = {}
         # 並列推論 (Parallel) 設定
@@ -1395,12 +1382,24 @@ class InferenceRuntime:
                             f"Trimming from {float(wav.shape[1]) / float(sr):.2f}s to {float(max_ref_samples) / float(sr):.2f}s."
                         )
                         wav = wav[:, :max_ref_samples]
-                piece = self.codec.encode_waveform(
-                    wav.unsqueeze(0),
-                    sample_rate=int(sr),
-                    normalize_db=req.ref_normalize_db,
-                    ensure_max=bool(req.ref_ensure_max),
-                ).cpu()
+                # 単数参照音声の場合はディスクキャッシュを使用
+                piece = None
+                cache_path = None
+                if len(wav_paths) == 1:
+                    cache_path = self._reference_latent_cache_path(req=req)
+                if cache_path is not None:
+                    piece = self._load_cached_reference_latent(cache_path, messages)
+                if piece is None:
+                    piece = self.codec.encode_waveform(
+                        wav.unsqueeze(0),
+                        sample_rate=int(sr),
+                        normalize_db=req.ref_normalize_db,
+                        ensure_max=bool(req.ref_ensure_max),
+                    ).cpu()
+                    if cache_path is not None:
+                        self._save_cached_reference_latent(
+                            cache_path=cache_path, ref_latent=piece, messages=messages,
+                        )
                 if piece.shape[1] == 0:
                     raise ValueError(f"Reference waveform produced an empty latent: {path}")
                 latent_pieces.append(piece)
@@ -1632,7 +1631,7 @@ class InferenceRuntime:
         else:
             used_seed = int(req.seed)
             _log(f"[runtime] using seed: {used_seed}")
-        post_load_t0 = _measure_start(self.model_device, self.codec_device)
+        post_load_t0 = _measure_start(self.model_device, self.codec_device, skip_timing_sync=self._skip_timing_sync)
 
         with self._lora_lock:
             lora_ctx = self._prepare_lora_for_request(
@@ -1646,12 +1645,12 @@ class InferenceRuntime:
         scope = _InferenceScope(self, lora_ctx, worker_id, semaphore)
 
         with scope, torch.inference_mode():
-            t0 = _measure_start(self.model_device)
+            t0 = _measure_start(self.model_device, skip_timing_sync=self._skip_timing_sync)
             text_ids, text_mask = self.tokenizer.batch_encode(
                 [normalized_text] * num_candidates,
                 max_length=text_max_len,
             )
-            stage_sec = _measure_end(self.model_device, t0)
+            stage_sec = _measure_end(self.model_device, t0, skip_timing_sync=self._skip_timing_sync)
             stage_timings.append(("tokenize_text", stage_sec))
             _log(f"[runtime] tokenize_text: {stage_sec * 1000.0:.1f} ms")
             text_ids = text_ids.to(self.model_device)
@@ -1673,7 +1672,7 @@ class InferenceRuntime:
                 caption_ids = caption_ids.to(self.model_device)
                 caption_mask = caption_mask.to(self.model_device)
 
-            t0 = _measure_start(self.model_device, self.codec_device)
+            t0 = _measure_start(self.model_device, self.codec_device, skip_timing_sync=self._skip_timing_sync)
             msg_count_before_ref = len(messages)
             (
                 speaker_state_override,
@@ -1691,7 +1690,7 @@ class InferenceRuntime:
                 )
             else:
                 ref_latent, ref_mask = None, None
-            stage_sec = _measure_end(self.model_device, t0, self.codec_device)
+            stage_sec = _measure_end(self.model_device, t0, self.codec_device, skip_timing_sync=self._skip_timing_sync)
             stage_timings.append(("prepare_reference", stage_sec))
             for msg in messages[msg_count_before_ref:]:
                 _log(msg)
@@ -1713,7 +1712,7 @@ class InferenceRuntime:
                 messages.append(duration_msg)
                 _log(duration_msg)
             elif self.model_cfg.use_duration_predictor:
-                t0 = _measure_start(self.model_device)
+                t0 = _measure_start(self.model_device, skip_timing_sync=self._skip_timing_sync)
                 has_speaker_duration = torch.zeros(
                     (num_candidates,), dtype=torch.bool, device=self.model_device
                 )
@@ -1770,7 +1769,7 @@ class InferenceRuntime:
                 latent_steps = int(round(scaled_frames))
                 latent_steps = max(min_frames, min(max_frames, latent_steps))
                 target_samples = int(latent_steps * hop_length)
-                stage_sec = _measure_end(self.model_device, t0)
+                stage_sec = _measure_end(self.model_device, t0, skip_timing_sync=self._skip_timing_sync)
                 stage_timings.append(("predict_duration", stage_sec))
                 msg = (
                     f"info: predicted duration frames={pred_frames:.1f}, "
@@ -1799,7 +1798,7 @@ class InferenceRuntime:
                     messages.append(msg)
                     _log(msg)
 
-            t0 = _measure_start(self.model_device)
+            t0 = _measure_start(self.model_device, skip_timing_sync=self._skip_timing_sync)
             z_patched = sample_euler_rf_cfg(
                 model=self.model,
                 text_input_ids=text_ids,
@@ -1830,22 +1829,22 @@ class InferenceRuntime:
                 t_schedule_mode=str(req.t_schedule_mode),
                 sway_coeff=float(req.sway_coeff),
             )
-            stage_sec = _measure_end(self.model_device, t0)
+            stage_sec = _measure_end(self.model_device, t0, skip_timing_sync=self._skip_timing_sync)
             stage_timings.append(("sample_rf", stage_sec))
             _log(f"[runtime] sample_rf: {stage_sec * 1000.0:.1f} ms")
 
-            t0 = _measure_start(self.model_device)
+            t0 = _measure_start(self.model_device, skip_timing_sync=self._skip_timing_sync)
             z = unpatchify_latent(
                 z_patched,
                 patch_size=self.model_cfg.latent_patch_size,
                 latent_dim=self.model_cfg.latent_dim,
             )
-            stage_sec = _measure_end(self.model_device, t0)
+            stage_sec = _measure_end(self.model_device, t0, skip_timing_sync=self._skip_timing_sync)
             stage_timings.append(("unpatchify_latent", stage_sec))
             _log(f"[runtime] unpatchify_latent: {stage_sec * 1000.0:.1f} ms")
             z = z[:, :latent_steps]
 
-            t0 = _measure_start(self.model_device, self.codec_device)
+            t0 = _measure_start(self.model_device, self.codec_device, skip_timing_sync=self._skip_timing_sync)
             trimmed_audios: list[torch.Tensor] = []
             if decode_mode == "batch":
                 audio_batch = self.codec.decode_latent(z).cpu()
@@ -1882,17 +1881,17 @@ class InferenceRuntime:
                         if flattening_samples > 0:
                             max_samples = min(max_samples, flattening_samples)
                     trimmed_audios.append(audio_i[:, :max_samples])
-            stage_sec = _measure_end(self.model_device, t0, self.codec_device)
+            stage_sec = _measure_end(self.model_device, t0, self.codec_device, skip_timing_sync=self._skip_timing_sync)
             stage_timings.append(("decode_latent", stage_sec))
             _log(f"[runtime] decode_latent ({decode_mode}): {stage_sec * 1000.0:.1f} ms")
 
             if self.watermarker is not None and self.watermarker.ready:
-                t0 = _measure_start(self.codec_device)
+                t0 = _measure_start(self.codec_device, skip_timing_sync=self._skip_timing_sync)
                 trimmed_audios = self.watermarker.encode_batch(
                     trimmed_audios,
                     sample_rate=int(self.codec.sample_rate),
                 )
-                stage_sec = _measure_end(self.codec_device, t0)
+                stage_sec = _measure_end(self.codec_device, t0, skip_timing_sync=self._skip_timing_sync)
                 stage_timings.append(("silentcipher_watermark", stage_sec))
                 _log(f"[runtime] silentcipher_watermark: {stage_sec * 1000.0:.1f} ms")
             else:
@@ -1903,7 +1902,7 @@ class InferenceRuntime:
                 messages.append(msg)
                 _log(msg)
 
-            total_to_decode = _measure_end(self.model_device, post_load_t0, self.codec_device)
+            total_to_decode = _measure_end(self.model_device, post_load_t0, self.codec_device, skip_timing_sync=self._skip_timing_sync)
             _log(f"[runtime] total_to_decode: {total_to_decode:.3f} s")
 
         _log("[runtime] done synthesize")
@@ -2242,6 +2241,20 @@ class InferenceRuntime:
         def _log(msg: str) -> None:
             if log_fn is not None:
                 log_fn(msg)
+
+        # sampling preset を適用
+        preset_messages: list[str] = []
+        preset_req = SamplingRequest(text="", sampling_preset=req.sampling_preset)
+        self._apply_sampling_preset(preset_req, preset_messages)
+        # preset で上書きされた値を LongTextSamplingRequest に反映
+        if req.sampling_preset is not None:
+            req.num_steps = preset_req.num_steps
+            req.cfg_guidance_mode = preset_req.cfg_guidance_mode
+            req.cfg_scale = preset_req.cfg_scale
+            req.cfg_min_t = preset_req.cfg_min_t
+            req.cfg_max_t = preset_req.cfg_max_t
+        for msg in preset_messages:
+            _log(msg)
 
         # テキスト分割
         split_result: LongTextSplitResult = split_long_text(
