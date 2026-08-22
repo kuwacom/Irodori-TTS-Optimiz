@@ -736,6 +736,11 @@ class _InferenceScope:
         if self._stream_ctx is not None:
             self._stream_ctx.__exit__(exc_type, exc_val, exc_tb)
             self._stream_ctx = None
+        # 並列推論時はセマフォ解放前にCUDA同期を行う
+        # codec が CPU の場合、model forward後のCUDA同期ポイントがなく
+        # 次スレッドのCUDA操作で前スレッドの非同期エラーが表面化するため
+        if self._runtime._cuda_streams and self._runtime.model_device.type == "cuda":
+            torch.cuda.synchronize(self._runtime.model_device)
         # LoRA context のクリーンアップ
         if self._lora_ctx is not None:
             self._lora_ctx.__exit__(exc_type, exc_val, exc_tb)
